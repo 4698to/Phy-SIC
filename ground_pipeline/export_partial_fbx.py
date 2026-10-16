@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import tempfile
+from array import array
 from pathlib import Path
 
 import bpy
@@ -11,9 +12,12 @@ from mathutils import Matrix, Vector
 
 response_path = Path(sys.argv[-2])
 output_path = Path(sys.argv[-1])
-blend_path = output_path.with_suffix(".blend")
+blend_path = output_path if output_path.suffix.lower() == ".blend" else output_path.with_suffix(".blend")
 with response_path.open("r", encoding="utf-8-sig") as f:
     data = json.load(f)
+if data.get("person_points") and len(data["person_points"]) > 20000:
+    stride = math.ceil(len(data["person_points"]) / 20000)
+    data["person_points"] = data["person_points"][::stride][:20000]
 
 normal = Vector(data["plane_normal"]).normalized()
 up = Vector((0.0, 0.0, -1.0))
@@ -33,8 +37,10 @@ def to_world(point):
     return tuple(q)
 
 def new_vertices_object(name, points):
+    coordinates = array("f", (component for point in points for component in point))
     mesh = bpy.data.meshes.new(name + "Mesh")
-    mesh.from_pydata(points, [], [])
+    mesh.vertices.add(len(coordinates) // 3)
+    mesh.vertices.foreach_set("co", coordinates)
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
     scene.collection.objects.link(obj)
@@ -51,6 +57,9 @@ scene.unit_settings.system = "METRIC"
 # Keep the exact API point arrays in the original camera coordinate system.
 plane_raw = new_vertices_object("API_plane_points_camera_xyz", data["plane_points"])
 inliers_raw = new_vertices_object("API_inlier_points_camera_xyz", data["inlier_points"])
+person_raw = None
+if data.get("person_points"):
+    person_raw = new_vertices_object("API_person_points_camera_xyz", data["person_points"])
 
 # Ground plane surface transformed to the ground-aligned local world frame.
 steps = int(round(math.sqrt(len(data["plane_points"]))))
@@ -68,32 +77,20 @@ mesh.update()
 ground = bpy.data.objects.new("Ground_Plane_World_Local", mesh)
 scene.collection.objects.link(ground)
 
-# Display mesh for the returned ground inlier sample points, preserving exact raw vertices above.
-base_verts = [Vector((0.0, 0.0, 0.0))]
-for i in range(1, 3):
-    z = 1.0 - i * 2.0 / 3.0
-    radius = math.sqrt(1.0 - z * z)
-    for j in range(5):
-        angle = 2.0 * math.pi * j / 5.0
-        base_verts.append(Vector((radius * math.cos(angle), radius * math.sin(angle), z)))
-base_verts.append(Vector((0.0, 0.0, -1.0)))
-base_faces = []
-for j in range(5):
-    jn = (j + 1) % 5
-    base_faces.extend(((0, 1 + j, 1 + jn), (11, 6 + jn, 6 + j), (1 + j, 6 + j, 6 + jn, 1 + jn)))
-point_radius = 0.012
-cloud_verts = []
-cloud_faces = []
-for point in data["inlier_points"]:
-    center = Vector(to_world(point))
-    offset = len(cloud_verts)
-    cloud_verts.extend(tuple(center + p * point_radius) for p in base_verts)
-    cloud_faces.extend(tuple(offset + i for i in face) for face in base_faces)
-cloud_mesh = bpy.data.meshes.new("GroundInlierMarkersMesh")
-cloud_mesh.from_pydata(cloud_verts, [], cloud_faces)
-cloud_mesh.update()
-cloud = bpy.data.objects.new("Ground_Inlier_Samples_Display", cloud_mesh)
-scene.collection.objects.link(cloud)
+# Display returned ground inliers as a lightweight vertex cloud in the ground-aligned frame.
+cloud = new_vertices_object("Ground_Inlier_Samples_Display", [to_world(p) for p in data["inlier_points"]])
+
+# Display returned person samples as a lightweight vertex cloud in the ground-aligned frame.
+person_display = None
+if person_raw is not None:
+    full_person_points = data["person_points"]
+    display_limit = 20000
+    stride = max(1, math.ceil(len(full_person_points) / display_limit))
+    display_points = full_person_points[::stride][:display_limit]
+    person_display = new_vertices_object("Person_PointCloud_Display_Sampled", [to_world(p) for p in display_points])
+    person_display["display_count"] = len(display_points)
+    person_display["source_count"] = len(full_person_points)
+    person_display["sampling_stride"] = stride
 
 # Approximate camera pose and intrinsics in the ground-aligned local frame.
 camera_data = bpy.data.cameras.new("EstimatedCamera")
@@ -147,15 +144,23 @@ metadata = bpy.data.objects.new("API_Response_Metadata", None)
 scene.collection.objects.link(metadata)
 metadata["coordinate_note"] = "Raw API point objects are in camera xyz; ground mesh is ground-aligned local world xyz."
 for key, value in data.items():
-    if key in {"plane_points", "inlier_points", "visualization"}:
+    if key in {"plane_points", "inlier_points", "person_points", "masks", "depth_b64", "visualization"}:
         continue
     metadata[key] = json.dumps(value, separators=(",", ":")) if isinstance(value, (list, dict)) else value
 metadata["visualization_keys"] = json.dumps(list(data.get("visualization", {}).keys()))
+metadata["mask_keys"] = json.dumps(list(data.get("masks", {}).keys()))
+if data.get("depth_b64"):
+    depth_path = output_path.with_name(output_path.stem + "_depth.npy")
+    depth_path.write_bytes(base64.b64decode(data["depth_b64"]))
+    metadata["depth_npy_filename"] = depth_path.name
+    depth_text = bpy.data.texts.new("API_depth_b64_npy")
+    depth_text.write(data["depth_b64"])
 
-# Embed the three API visualization images as textured image cards in the FBX.
+# Embed API visualization and segmentation masks as textured image cards.
 image_cards = []
 image_tmp_paths = []
 image_items = list(data.get("visualization", {}).items())
+image_items.extend(("mask_" + key, value) for key, value in data.get("masks", {}).items() if value)
 card_x = 2.0
 card_gap = 0.12
 card_h = 0.8
@@ -203,31 +208,17 @@ for index, (key, uri) in enumerate(image_items):
 # Export selected asset objects and custom properties; packed texture files are embedded.
 for obj in bpy.context.selected_objects:
     obj.select_set(False)
-export_objects = [plane_raw, inliers_raw, ground, cloud, camera, metadata, *person_objects, *image_cards]
+export_objects = [plane_raw, inliers_raw, *([person_raw] if person_raw else []), ground, cloud, *([person_display] if person_display else []), camera, metadata, *person_objects, *image_cards]
 for obj in export_objects:
     obj.select_set(True)
 bpy.context.view_layer.objects.active = ground
-output_path.parent.mkdir(parents=True, exist_ok=True)
-bpy.ops.export_scene.fbx(
-    filepath=str(output_path),
-    use_selection=True,
-    apply_unit_scale=True,
-    global_scale=1.0,
-    axis_forward="-Z",
-    axis_up="Y",
-    object_types={"MESH", "CAMERA", "EMPTY"},
-    use_custom_props=True,
-    path_mode="COPY",
-    embed_textures=True,
-    bake_anim=False,
-)
+blend_path.parent.mkdir(parents=True, exist_ok=True)
 for temp_name in image_tmp_paths:
     try:
         os.remove(temp_name)
     except OSError:
         pass
-print("FBX_EXPORTED", output_path, output_path.stat().st_size)
 bpy.ops.wm.save_as_mainfile(filepath=str(blend_path), compress=True)
 print("BLEND_SAVED", blend_path, blend_path.stat().st_size)
 print("OBJECTS", [(obj.name, obj.type, len(obj.data.vertices) if obj.type == "MESH" else None) for obj in export_objects])
-print("EMBEDDED_VISUALIZATIONS", [obj.name for obj in image_cards])
+print("EMBEDDED_IMAGES", [obj.name for obj in image_cards])
