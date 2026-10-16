@@ -130,6 +130,83 @@ def _cloud_png(inlier_points, plane_points, grid_steps, camera_height_m) -> str:
     return _to_data_uri(buf)
 
 
+def _world3d_png(depth, intrinsics, inlier_points, plane_grid, plane_normal, plane_d) -> str:
+    """世界 3D 视角：地面法向量对齐到 -z，地面 z=0、物体离地高度为正（与 instance_ground_views 一致）。
+
+    - scene 点云按离地高度着色（viridis）
+    - 地面内点（绿）、拟合地面平面（红网格）、相机位置（红星）
+    - 采样反投影，避免大图全量反投影的内存峰值
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fx, cx = float(intrinsics[0, 0]), float(intrinsics[0, 2])
+    fy, cy = float(intrinsics[1, 1]), float(intrinsics[1, 2])
+
+    def rotate_to_up(n, up=(0.0, 0.0, -1.0)):
+        """Rodrigues 旋转：把法向量 n 对齐到 up。"""
+        n = n / np.linalg.norm(n)
+        up = np.asarray(up, dtype=float)
+        up = up / np.linalg.norm(up)
+        v = np.cross(n, up)
+        s = np.linalg.norm(v)
+        c = float(np.dot(n, up))
+        if s < 1e-9:
+            return np.eye(3) if c > 0 else -np.eye(3)
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=float)
+        return np.eye(3) + vx + vx @ vx * ((1 - c) / s**2)
+
+    # 采样场景点（不生成全量 HxWx3 数组）
+    h, w = depth.shape
+    valid = np.isfinite(depth) & (depth > 0)
+    idx = np.flatnonzero(valid.ravel())
+    n_scene = min(150_000, len(idx))
+    if len(idx) > n_scene:
+        idx = np.random.default_rng(1).choice(idx, n_scene, replace=False)
+    rows = idx // w
+    cols = idx % w
+    z = depth.ravel()[idx]
+    scene = np.stack([(cols - cx) * z / fx, (rows - cy) * z / fy, z], axis=-1)
+
+    # 相机系 -> 世界系
+    R = rotate_to_up(np.asarray(plane_normal, dtype=float))
+    wscene = scene @ R.T
+    win = np.asarray(inlier_points, dtype=float) @ R.T
+    wground = np.asarray(plane_grid, dtype=float) @ R.T
+    wscene[:, 2] -= plane_d
+    win[:, 2] -= plane_d
+    wground[:, 2] -= plane_d
+    cam_world = np.array([0.0, 0.0, -plane_d], dtype=float)
+
+    n_in = min(80_000, len(win))
+    if len(win) > n_in:
+        win = win[np.random.default_rng(1).choice(len(win), n_in, replace=False)]
+
+    zmin, zmax = np.percentile(wscene[:, 2], [2, 98])
+    fig = plt.figure(figsize=(10.5, 9), dpi=100)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(wscene[:, 0], wscene[:, 1], wscene[:, 2], c=wscene[:, 2], cmap="viridis",
+               s=0.4, alpha=0.35, vmin=zmin, vmax=zmax)
+    ax.scatter(win[:, 0], win[:, 1], win[:, 2], c="#2ef05c", s=0.6, alpha=0.55)
+    ax.plot_surface(wground[:, :, 0], wground[:, :, 1], wground[:, :, 2], color="red", alpha=0.45)
+    center = win.mean(axis=0)
+    ax.quiver(center[0], center[1], center[2], 0, 0, 1, length=1.5, color="k", arrow_length_ratio=0.15)
+    ax.scatter([cam_world[0]], [cam_world[1]], [cam_world[2]], c="red", s=60, marker="*")
+    ax.set_xlabel("world x (m)")
+    ax.set_ylabel("world y (m)")
+    ax.set_zlabel("height above ground (m)")
+    ax.set_title("GROUND in world 3D | ground at z=0, normal->up", fontsize=12)
+    ax.set_box_aspect((1, 1, 1))
+    ax.view_init(elev=25, azim=-60)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="PNG", bbox_inches="tight")
+    plt.close(fig)
+    return _to_data_uri(buf)
+
+
 def create_ground_app(
     *,
     device: str = "auto",
@@ -232,6 +309,14 @@ def create_ground_app(
             visualization = {
                 "overlay": _overlay_png(rgb, floor_mask, result["plane_inlier_mask"]),
                 "cloud": _cloud_png(inliers_arr, grid, request.grid_steps, abs(float(result["plane_d"]))),
+                "world_3d": _world3d_png(
+                    depth,
+                    intrinsics,
+                    result["plane_inlier_points"],
+                    grid,
+                    result["plane_normal"],
+                    float(result["plane_d"]),
+                ),
             }
 
         return GroundResult(

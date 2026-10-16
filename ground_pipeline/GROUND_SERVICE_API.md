@@ -117,21 +117,23 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
   "inlier_points": [[0.08, -1.30, 1.01], "...（共 2000 个点）"],
   "visualization": {
     "overlay": "data:image/png;base64,iVBORw0KGgo...",
-    "cloud": "data:image/png;base64,iVBORw0KGgo..."
+    "cloud": "data:image/png;base64,iVBORw0KGgo...",
+    "world_3d": "data:image/png;base64,iVBORw0KGgo..."
   }
 }
 ```
 
 #### 可视化输出（`visualize: true`）
 
-响应中的 `visualization` 为两个 PNG data URI（可直接用于 `<img src="...">`）：
+响应中的 `visualization` 为三个 PNG data URI（可直接用于 `<img src="...">`）：
 
 | key | 内容 | 用途 |
 |---|---|---|
 | `overlay` | 原图叠加半透明色块：绿色 = LangSAM 分割的地面 mask，蓝色 = RANSAC 平面内点 | 直观检查分割与拟合是否对准地面 |
-| `cloud` | matplotlib 3D 点云图：内点按深度着色，橙色网格为拟合的地面平面 | 检查平面拟合质量、相机高度与地面朝向 |
+| `cloud` | matplotlib 3D 点云图（相机坐标系）：内点按深度着色，橙色网格为拟合的地面平面 | 检查平面拟合质量、相机高度与地面朝向 |
+| `world_3d` | matplotlib 3D 点云图（世界坐标系）：场景点云按离地高度着色，绿色地面内点、红色地面平面网格、红星为相机位置；地面 `z=0`，物体离地高度为正 | 直观确认"地面平放、法向量朝上"，适合作为最终结果图 |
 
-> 注意：`visualize` 会增加约 0.5~1s 与 ~300KB 响应体积，仅在需要人工确认时开启。
+> 注意：`visualize` 会增加约 1~3s 与 ~800KB 响应体积（`world_3d` 渲染大场景点云较慢），仅在需要人工确认时开启。
 
 #### 坐标系约定
 
@@ -203,7 +205,7 @@ print(result["camera_height_m"], result["plane_normal"], len(result["plane_point
 
 # 保存可视化图（data URI -> 文件）
 import re
-for key in ("overlay", "cloud"):
+for key in ("overlay", "cloud", "world_3d"):
     uri = result["visualization"][key]
     raw = re.sub("^data:image/png;base64,", "", uri)
     with open(f"/tmp/ground_{key}.png", "wb") as f:
