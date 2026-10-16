@@ -47,6 +47,8 @@ class GroundRequest(BaseModel):
     distance_threshold: Optional[float] = Field(0.02, gt=0, description="平面拟合距离阈值（米）")
     iterations: Optional[int] = Field(256, ge=1, description="RANSAC 迭代次数")
     grid_steps: Optional[int] = Field(100, ge=2, description="平面网格分辨率")
+    return_data: Optional[bool] = Field(False, description="为 true 时额外返回 masks（base64 PNG）、人物点云采样与全量深度图（.npy base64）")
+    person_points_limit: Optional[int] = Field(2000, ge=1, le=100000, description="return_data 时人物点云采样上限")
     visualize: Optional[bool] = Field(False, description="返回可视化图片（overlay 覆盖图 + cloud 3D 点云图）")
 
 
@@ -70,6 +72,9 @@ class GroundResult(BaseModel):
     contact_pixels: Optional[int] = None
     contact_centroid_m: Optional[List[float]] = None
     contact_bbox: Optional[List[int]] = None
+    masks: Optional[Dict[str, Optional[str]]] = None
+    person_points: Optional[List[List[float]]] = None
+    depth_b64: Optional[str] = None
     visualization: Optional[Dict[str, str]] = None
 
 
@@ -92,6 +97,23 @@ def _load_image(source: str):
 def _to_data_uri(buf: io.BytesIO) -> str:
     """BytesIO PNG -> base64 data URI，便于下游直接 <img src> 使用。"""
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _mask_png(mask: np.ndarray) -> str:
+    """二值 mask -> 8-bit 灰度 PNG base64 data URI（0/255，可用 PIL/OpenCV 直接还原为布尔数组）。"""
+    from PIL import Image
+
+    im = Image.fromarray((mask.astype(np.uint8)) * 255, mode="L")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG", optimize=True)
+    return _to_data_uri(buf)
+
+
+def _npy_b64(arr: np.ndarray) -> str:
+    """ndarray -> np.save 字节流 base64（float32 .npy，下游 np.load(io.BytesIO(base64.b64decode(s))) 还原）。"""
+    buf = io.BytesIO()
+    np.save(buf, np.asarray(arr, dtype=np.float32))
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def _person_mask(segmenter, image_pil, person_prompt: str) -> Optional[np.ndarray]:
@@ -394,6 +416,25 @@ def create_ground_app(
         inliers_arr = inliers_arr[rng.choice(len(inliers_arr), size=min(2000, len(inliers_arr)), replace=False)]
         grid = result["plane_points"].reshape(request.grid_steps, request.grid_steps, 3)
 
+        # return_data=true 时，返回全量像素级数据：四张 mask PNG、人物点云采样、全量深度图（.npy base64）。
+        masks = None
+        person_points = None
+        depth_b64 = None
+        if request.return_data:
+            masks = {
+                "floor": _mask_png(floor_mask),
+                "inlier": _mask_png(result["plane_inlier_mask"]),
+                "person": _mask_png(person_mask) if person_mask is not None else None,
+                "contact": _mask_png(contact_mask) if contact_mask is not None else None,
+            }
+            if person_mask is not None and person_mask.any():
+                ppts = result["points"][person_mask]
+                ppts = ppts[np.isfinite(ppts).all(axis=-1)]
+                if len(ppts) > request.person_points_limit:
+                    ppts = ppts[rng.choice(len(ppts), request.person_points_limit, replace=False)]
+                person_points = ppts.astype(float).tolist()
+            depth_b64 = _npy_b64(depth)
+
         visualization = None
         if request.visualize:
             visualization = {
@@ -427,6 +468,9 @@ def create_ground_app(
             contact_pixels=contact_pixels,
             contact_centroid_m=contact_centroid_m,
             contact_bbox=contact_bbox,
+            masks=masks,
+            person_points=person_points,
+            depth_b64=depth_b64,
             visualization=visualization,
         )
 
