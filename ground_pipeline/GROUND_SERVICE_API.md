@@ -64,6 +64,8 @@ run_ground_pipeline.bat
 | `distance_threshold` | number | 否 | `0.02` | 平面拟合距离阈值（米），控制哪些点算"属于地面平面" |
 | `iterations` | integer | 否 | `256` | RANSAC 迭代次数 |
 | `grid_steps` | integer | 否 | `100` | 平面网格分辨率（返回 `grid_steps × grid_steps` 个平面采样点） |
+| `return_data` | bool | 否 | `false` | 为 `true` 时额外返回全量像素级数据：`masks`（四张 PNG base64）、`person_points`（人物点云采样）、`depth_b64`（全量深度 .npy base64）。响应体积明显增大，按需开启 |
+| `person_points_limit` | integer | 否 | `2000` | `return_data=true` 时人物点云采样上限 |
 | `visualize` | bool | 否 | `false` | 为 `true` 时返回可视化图片（见下方"可视化输出"） |
 
 #### 请求示例
@@ -104,6 +106,9 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
 | `contact_pixels` | int \| null | 接触区域像素数：人物 mask 中反投影 3D 点距地面平面 ≤ `contact_threshold` 的像素。未启用人物分割时为 `null` |
 | `contact_centroid_m` | [x, y, z] \| null | 接触区域 3D 质心（相机坐标系，米），无接触时 `null` |
 | `contact_bbox` | [x1, y1, x2, y2] \| null | 接触区域在图像上的包围框（像素），无接触时 `null` |
+| `masks` | object \| null | 仅 `return_data=true`：`{"floor","inlier","person","contact"}`，各为 8-bit 灰度 PNG base64 data URI（0/255，可还原布尔数组）；`person`/`contact` 无对应数据时为 `null` |
+| `person_points` | `[[x,y,z], ...]` \| null | 仅 `return_data=true`：人物 mask 3D 点云采样（相机坐标系，米，≤`person_points_limit` 个） |
+| `depth_b64` | string \| null | 仅 `return_data=true`：全量深度图 float32 `.npy` 的 base64（`np.load(io.BytesIO(base64.b64decode(s)))` 还原） |
 | `plane_points` | `[[x,y,z], ...]` | 地面上网格采样点（`grid_steps²` 个，相机坐标系，米） |
 | `inlier_points` | `[[x,y,z], ...]` | 地面内点 3D 坐标采样（最多 2000 个，随机抽样，相机坐标系，米） |
 | `visualization` | object \| null | 仅 `visualize=true` 时返回，见下方"可视化输出" |
