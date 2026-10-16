@@ -109,6 +109,39 @@ camera.rotation_mode = "QUATERNION"
 camera.rotation_quaternion = Matrix((right, cam_up, -forward)).transposed().to_quaternion()
 scene.camera = camera
 
+# Visualize the API's person bbox and centroids; the API does not return person point samples.
+person_objects = []
+bbox_values = data.get("person_bbox_3d_m")
+if bbox_values is not None:
+    lo = bbox_values[:3]
+    hi = bbox_values[3:]
+    camera_corners = [
+        (x, y, z)
+        for x in (lo[0], hi[0])
+        for y in (lo[1], hi[1])
+        for z in (lo[2], hi[2])
+    ]
+    corner_order = [0, 1, 3, 2, 4, 5, 7, 6]
+    edge_pairs = [(0, 1), (1, 3), (3, 2), (2, 0), (4, 5), (5, 7), (7, 6), (6, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
+    bbox_mesh = bpy.data.meshes.new("PersonBBoxMesh")
+    bbox_mesh.from_pydata([to_world(p) for p in camera_corners], [(corner_order[a], corner_order[b]) for a, b in edge_pairs], [])
+    bbox_mesh.update()
+    bbox_obj = bpy.data.objects.new("Person_3D_BBox_Estimated", bbox_mesh)
+    scene.collection.objects.link(bbox_obj)
+    bbox_obj["source"] = "API person_bbox_3d_m; estimated AABB in camera coordinates"
+    person_objects.append(bbox_obj)
+
+    for field, name, radius in (("person_centroid_m", "Person_Centroid_Estimated", 0.045), ("contact_centroid_m", "Person_GroundContact_Centroid_Estimated", 0.06)):
+        value = data.get(field)
+        if value is None:
+            continue
+        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=2, radius=radius, location=to_world(value))
+        marker = bpy.context.object
+        marker.name = name
+        marker["source_field"] = field
+        marker["camera_xyz_m"] = json.dumps(value, separators=(",", ":"))
+        person_objects.append(marker)
+
 # Preserve API scalar/array fields as FBX custom properties, excluding point arrays represented above.
 metadata = bpy.data.objects.new("API_Response_Metadata", None)
 scene.collection.objects.link(metadata)
@@ -170,7 +203,7 @@ for index, (key, uri) in enumerate(image_items):
 # Export selected asset objects and custom properties; packed texture files are embedded.
 for obj in bpy.context.selected_objects:
     obj.select_set(False)
-export_objects = [plane_raw, inliers_raw, ground, cloud, camera, metadata, *image_cards]
+export_objects = [plane_raw, inliers_raw, ground, cloud, camera, metadata, *person_objects, *image_cards]
 for obj in export_objects:
     obj.select_set(True)
 bpy.context.view_layer.objects.active = ground
