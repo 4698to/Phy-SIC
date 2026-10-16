@@ -33,7 +33,7 @@ run_ground_pipeline.bat
 | 环境 | 地址 |
 |---|---|
 | 本机（Windows 访问 WSL） | `http://127.0.0.1:8001` |
-| 局域网其他机器 | 需先以管理员运行 [map_ground.bat](file:///G:/UGit/Phy-SIC/ground_pipeline/map_ground.bat)，然后访问 `http://<本机IP>:8001` |
+| 局域网其他机器 | 需先以管理员运行 [map_ground.bat](file:///G:/UGit/Phy-SIC/ground_pipeline/map_ground.bat)，然后访问 `http://192.168.139.130:8001` |
 
 ---
 
