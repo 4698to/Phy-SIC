@@ -42,6 +42,8 @@ class GroundRequest(BaseModel):
 
     image: str = Field(..., description="Base64 data URI / HTTP URL / 本地文件路径")
     floor_prompt: Optional[str] = Field(DEFAULT_FLOOR_PROMPT, description="地面分割文本提示")
+    person_prompt: Optional[str] = Field("person.", description="人物分割文本提示；传空串则跳过接触区域检测")
+    contact_threshold: Optional[float] = Field(0.05, gt=0, description="接触区域判定距离阈值（米）：人物 mask 反投影点与拟合地面平面的距离小于该值即视为接触")
     distance_threshold: Optional[float] = Field(0.02, gt=0, description="平面拟合距离阈值（米）")
     iterations: Optional[int] = Field(256, ge=1, description="RANSAC 迭代次数")
     grid_steps: Optional[int] = Field(100, ge=2, description="平面网格分辨率")
@@ -62,6 +64,12 @@ class GroundResult(BaseModel):
     plane_inliers: int
     plane_points: List[List[float]]
     inlier_points: List[List[float]]
+    person_pixels: Optional[int] = None
+    person_bbox_3d_m: Optional[List[float]] = None
+    person_centroid_m: Optional[List[float]] = None
+    contact_pixels: Optional[int] = None
+    contact_centroid_m: Optional[List[float]] = None
+    contact_bbox: Optional[List[int]] = None
     visualization: Optional[Dict[str, str]] = None
 
 
@@ -86,18 +94,59 @@ def _to_data_uri(buf: io.BytesIO) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def _overlay_png(rgb, floor_mask, inlier_mask) -> str:
-    """原图 + 地面 mask（绿）+ 平面内点 mask（蓝）覆盖图。"""
+def _person_mask(segmenter, image_pil, person_prompt: str) -> Optional[np.ndarray]:
+    """用 LangSAM 分割人物 mask：GroundingDINO 文本检测 + SAM 分割，多实例取并集。
+
+    提示词为空或未检出人物时返回 None，不抛错。
+    """
+    if person_prompt is None or not person_prompt.strip():
+        return None
+    segmentation = segmenter.predict([image_pil], [person_prompt])[0]
+    masks = np.asarray(segmentation["masks"], dtype=bool)
+    if masks.ndim == 2:
+        return masks
+    if masks.ndim == 3 and masks.shape[0] > 0:
+        return masks.any(axis=0)
+    return None
+
+
+def _contact_region(
+    person_mask: Optional[np.ndarray],
+    points: np.ndarray,
+    plane_normal: np.ndarray,
+    plane_d: float,
+    threshold: float,
+) -> tuple[int, Optional[np.ndarray]]:
+    """人物 mask 与地面平面的几何接触区域。
+
+    判据：人物 mask 像素反投影到相机系 3D 点后，与拟合地面平面 |n·p + d| <= threshold，
+    即该部位贴在地面上。返回 (接触像素数, 接触 mask)；无接触时 mask 为 None。
+    """
+    if person_mask is None:
+        return 0, None
+    distance = np.abs(points @ plane_normal + plane_d)
+    valid = np.isfinite(points).all(axis=-1)
+    contact = person_mask & valid & (distance <= threshold)
+    count = int(contact.sum())
+    return (count, contact if count > 0 else None)
+
+
+def _overlay_png(rgb, floor_mask, inlier_mask, person_mask=None, contact_mask=None) -> str:
+    """原图 + 地面 mask（绿）+ 平面内点 mask（蓝）+ 人物 mask（黄）+ 接触区域（红）覆盖图。"""
     from PIL import Image
 
     base = Image.fromarray(rgb).convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    floor_im = Image.fromarray((floor_mask.astype(np.uint8)) * 255)
-    inlier_im = Image.fromarray((inlier_mask.astype(np.uint8)) * 255)
     green = Image.new("RGBA", base.size, (46, 204, 113, 70))
-    overlay.paste(green, (0, 0), floor_im)
+    overlay.paste(green, (0, 0), Image.fromarray((floor_mask.astype(np.uint8)) * 255))
     blue = Image.new("RGBA", base.size, (41, 128, 185, 110))
-    overlay.paste(blue, (0, 0), inlier_im)
+    overlay.paste(blue, (0, 0), Image.fromarray((inlier_mask.astype(np.uint8)) * 255))
+    if person_mask is not None:
+        yellow = Image.new("RGBA", base.size, (241, 196, 15, 50))
+        overlay.paste(yellow, (0, 0), Image.fromarray((person_mask.astype(np.uint8)) * 255))
+    if contact_mask is not None:
+        red = Image.new("RGBA", base.size, (231, 76, 60, 160))
+        overlay.paste(red, (0, 0), Image.fromarray((contact_mask.astype(np.uint8)) * 255))
     merged = Image.alpha_composite(base, overlay).convert("RGB")
     buf = io.BytesIO()
     merged.save(buf, format="PNG")
@@ -213,6 +262,7 @@ def create_ground_app(
     sam_type: str = "sam2.1_hiera_small",
     sam_ckpt: str | Path = DEFAULT_SAM_CKPT,
     floor_prompt: str = DEFAULT_FLOOR_PROMPT,
+    person_prompt: str = "person.",
 ) -> FastAPI:
     state: Dict[str, Any] = {"segmenter": None, "depth": None, "transform": None, "device": torch.device("cpu")}
 
@@ -273,6 +323,17 @@ def create_ground_app(
         else:
             raise HTTPException(status_code=404, detail="未检出地面区域")
 
+        # 人物 mask：提示词为空则跳过接触区域检测，人物分割失败不影响地面结果。
+        if request.person_prompt is None:
+            request.person_prompt = person_prompt
+        person_mask = None
+        if request.person_prompt.strip():
+            try:
+                person_mask = _person_mask(state["segmenter"], image_pil, request.person_prompt)
+            except Exception as e:
+                logger.warning("人物分割失败，跳过接触区域检测: %s", e)
+                person_mask = None
+
         try:
             model, transform, device = state["depth"], state["transform"], state["device"]
             tensor = transform(rgb).to(device)
@@ -299,6 +360,35 @@ def create_ground_app(
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
 
+        # 人物 3D 点云 bbox（相机坐标系轴对齐）：取人物 mask 中有效反投影点的 x/y/z min/max。
+        person_bbox_3d_m = None
+        person_centroid_m = None
+        if person_mask is not None and person_mask.any():
+            pts = result["points"][person_mask]
+            valid = np.isfinite(pts).all(axis=-1)
+            if valid.any():
+                pts = pts[valid]
+                mn = pts.min(axis=0)
+                mx = pts.max(axis=0)
+                person_bbox_3d_m = [float(mn[0]), float(mn[1]), float(mn[2]), float(mx[0]), float(mx[1]), float(mx[2])]
+                person_centroid_m = pts.mean(axis=0).astype(float).tolist()
+
+        # 接触区域：人物 mask 反投影点中，与拟合地面平面距离 <= contact_threshold 的像素。
+        contact_pixels, contact_mask = _contact_region(
+            person_mask,
+            result["points"],
+            result["plane_normal"],
+            float(result["plane_d"]),
+            request.contact_threshold,
+        )
+        contact_centroid_m = None
+        contact_bbox = None
+        if contact_mask is not None:
+            ys, xs = np.nonzero(contact_mask)
+            pts = result["points"][contact_mask]
+            contact_centroid_m = pts.mean(axis=0).astype(float).tolist()
+            contact_bbox = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+
         rng = np.random.default_rng(0)
         inliers_arr = result["plane_inlier_points"]
         inliers_arr = inliers_arr[rng.choice(len(inliers_arr), size=min(2000, len(inliers_arr)), replace=False)]
@@ -307,7 +397,7 @@ def create_ground_app(
         visualization = None
         if request.visualize:
             visualization = {
-                "overlay": _overlay_png(rgb, floor_mask, result["plane_inlier_mask"]),
+                "overlay": _overlay_png(rgb, floor_mask, result["plane_inlier_mask"], person_mask, contact_mask),
                 "cloud": _cloud_png(inliers_arr, grid, request.grid_steps, abs(float(result["plane_d"]))),
                 "world_3d": _world3d_png(
                     depth,
@@ -331,6 +421,12 @@ def create_ground_app(
             plane_inliers=int(result["plane_inlier_mask"].sum()),
             plane_points=grid.reshape(-1, 3).astype(float).tolist(),
             inlier_points=inliers_arr.astype(float).tolist(),
+            person_pixels=None if person_mask is None else int(person_mask.sum()),
+            person_bbox_3d_m=person_bbox_3d_m,
+            person_centroid_m=person_centroid_m,
+            contact_pixels=contact_pixels,
+            contact_centroid_m=contact_centroid_m,
+            contact_bbox=contact_bbox,
             visualization=visualization,
         )
 
@@ -347,6 +443,7 @@ if __name__ == "__main__":
     parser.add_argument("--sam-type", type=str, default="sam2.1_hiera_small", help="SAM2 模型类型")
     parser.add_argument("--sam-ckpt", type=str, default=str(DEFAULT_SAM_CKPT), help="SAM2 权重路径")
     parser.add_argument("--floor-prompt", type=str, default=DEFAULT_FLOOR_PROMPT, help="默认地面分割提示词")
+    parser.add_argument("--person-prompt", type=str, default="person.", help="默认人物分割提示词；传空串禁用接触区域检测")
 
     args = parser.parse_args()
     app = create_ground_app(
@@ -354,6 +451,7 @@ if __name__ == "__main__":
         sam_type=args.sam_type,
         sam_ckpt=args.sam_ckpt,
         floor_prompt=args.floor_prompt,
+        person_prompt=args.person_prompt,
     )
     logger.info("启动 ground_pipeline 服务 %s:%s", args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port)

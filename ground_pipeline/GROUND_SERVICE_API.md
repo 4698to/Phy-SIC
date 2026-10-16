@@ -59,6 +59,8 @@ run_ground_pipeline.bat
 |---|---|---|---|---|
 | `image` | string | 是 | - | 三种格式任选：Base64 data URI、HTTP(S) URL、服务端本地文件路径 |
 | `floor_prompt` | string | 否 | `floor, wooden floor.` | 地面分割文本提示词（英文效果更佳，如 `floor, wooden floor.` / `ground, concrete ground.`） |
+| `person_prompt` | string | 否 | `person.` | 人物分割文本提示词；**传空串则跳过接触区域检测**。多人物场景可写 `person.` 自动取并集 |
+| `contact_threshold` | number | 否 | `0.05` | 接触区域判定距离阈值（米）：人物 mask 反投影点与拟合地面平面距离 ≤ 该值视为接触（近似脚底/贴地部位） |
 | `distance_threshold` | number | 否 | `0.02` | 平面拟合距离阈值（米），控制哪些点算"属于地面平面" |
 | `iterations` | integer | 否 | `256` | RANSAC 迭代次数 |
 | `grid_steps` | integer | 否 | `100` | 平面网格分辨率（返回 `grid_steps × grid_steps` 个平面采样点） |
@@ -96,6 +98,12 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
 | `image_hw` | [h, w] | 输入图片尺寸（像素） |
 | `floor_pixels` | int | LangSAM 分割出的地面像素数 |
 | `plane_inliers` | int | RANSAC 拟合出的地面内点像素数 |
+| `person_pixels` | int \| null | 人物 mask 像素数；`person_prompt` 为空或未检出人物时为 `null` |
+| `person_bbox_3d_m` | [x1,y1,z1,x2,y2,z2] \| null | 人物 3D 点云轴对齐包围框（相机坐标系，米）：`points[person_mask]` 有效点的 x/y/z min/max |
+| `person_centroid_m` | [x, y, z] \| null | 人物 3D 点云质心（相机坐标系，米） |
+| `contact_pixels` | int \| null | 接触区域像素数：人物 mask 中反投影 3D 点距地面平面 ≤ `contact_threshold` 的像素。未启用人物分割时为 `null` |
+| `contact_centroid_m` | [x, y, z] \| null | 接触区域 3D 质心（相机坐标系，米），无接触时 `null` |
+| `contact_bbox` | [x1, y1, x2, y2] \| null | 接触区域在图像上的包围框（像素），无接触时 `null` |
 | `plane_points` | `[[x,y,z], ...]` | 地面上网格采样点（`grid_steps²` 个，相机坐标系，米） |
 | `inlier_points` | `[[x,y,z], ...]` | 地面内点 3D 坐标采样（最多 2000 个，随机抽样，相机坐标系，米） |
 | `visualization` | object \| null | 仅 `visualize=true` 时返回，见下方"可视化输出" |
@@ -129,7 +137,7 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
 
 | key | 内容 | 用途 |
 |---|---|---|
-| `overlay` | 原图叠加半透明色块：绿色 = LangSAM 分割的地面 mask，蓝色 = RANSAC 平面内点 | 直观检查分割与拟合是否对准地面 |
+| `overlay` | 原图叠加半透明色块：绿色 = LangSAM 分割的地面 mask，蓝色 = RANSAC 平面内点，黄色 = 人物 mask，红色 = 接触区域 | 直观检查分割/拟合是否对准地面，及人物与地面接触位置 |
 | `cloud` | matplotlib 3D 点云图（相机坐标系）：内点按深度着色，橙色网格为拟合的地面平面 | 检查平面拟合质量、相机高度与地面朝向 |
 | `world_3d` | matplotlib 3D 点云图（世界坐标系）：场景点云按离地高度着色，绿色地面内点、红色地面平面网格、红星为相机位置；地面 `z=0`，物体离地高度为正 | 直观确认"地面平放、法向量朝上"，适合作为最终结果图 |
 
