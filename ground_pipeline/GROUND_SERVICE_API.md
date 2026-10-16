@@ -130,23 +130,21 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
   "inlier_points": [[0.08, -1.30, 1.01], "...（共 2000 个点）"],
   "visualization": {
     "overlay": "data:image/png;base64,iVBORw0KGgo...",
-    "cloud": "data:image/png;base64,iVBORw0KGgo...",
-    "world_3d": "data:image/png;base64,iVBORw0KGgo..."
+    "views": "data:image/png;base64,iVBORw0KGgo..."
   }
 }
 ```
 
 #### 可视化输出（`visualize: true`）
 
-响应中的 `visualization` 为三个 PNG data URI（可直接用于 `<img src="...">`）：
+响应中的 `visualization` 为两个 PNG data URI（可直接用于 `<img src="...">`）：
 
 | key | 内容 | 用途 |
 |---|---|---|
 | `overlay` | 原图叠加半透明色块：绿色 = LangSAM 分割的地面 mask，蓝色 = RANSAC 平面内点，黄色 = 人物 mask，红色 = 接触区域 | 直观检查分割/拟合是否对准地面，及人物与地面接触位置 |
-| `cloud` | matplotlib 3D 点云图（相机坐标系）：内点按深度着色，橙色网格为拟合的地面平面 | 检查平面拟合质量、相机高度与地面朝向 |
-| `world_3d` | matplotlib 3D 点云图（世界坐标系）：场景点云按离地高度着色，绿色地面内点、红色地面平面网格、红星为相机位置；地面 `z=0`，物体离地高度为正 | 直观确认"地面平放、法向量朝上"，适合作为最终结果图 |
+| `views` | **相机视角与世界 3D 视角左右拼合对比图**（单张 matplotlib 3D 图）：两面板都叠加场景点云、地面内点（绿）、拟合地面平面网格（相机面板橙色 / 世界面板红色）、人物点云（黄）、相机视锥（青色棱线 + 蓝色观察方向箭头，顶点为相机位置、近平面按图像四角投影）；左面板为相机坐标系（x 右、y 下、z 前，相机在原点），右面板为世界坐标系（地面 `z=0`、法向量朝上、物体离地高度为正，含法向箭头） | 左侧检查相机视角下的拟合质量，右侧确认"地面平放、法向量朝上"及人物/相机空间位置与观察角度，一张图完成对比 |
 
-> 注意：`visualize` 会增加约 1~3s 与 ~800KB 响应体积（`world_3d` 渲染大场景点云较慢），仅在需要人工确认时开启。
+> 注意：`visualize` 会增加约 2~4s 与 ~800KB 响应体积（`views` 需渲染两个 3D 场景面板），仅在需要人工确认时开启。
 
 #### 坐标系约定
 
@@ -218,7 +216,7 @@ print(result["camera_height_m"], result["plane_normal"], len(result["plane_point
 
 # 保存可视化图（data URI -> 文件）
 import re
-for key in ("overlay", "cloud", "world_3d"):
+for key in ("overlay", "views"):
     uri = result["visualization"][key]
     raw = re.sub("^data:image/png;base64,", "", uri)
     with open(f"/tmp/ground_{key}.png", "wb") as f:

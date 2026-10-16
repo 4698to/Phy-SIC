@@ -175,38 +175,12 @@ def _overlay_png(rgb, floor_mask, inlier_mask, person_mask=None, contact_mask=No
     return _to_data_uri(buf)
 
 
-def _cloud_png(inlier_points, plane_points, grid_steps, camera_height_m) -> str:
-    """地面内点 + 地面平面网格的 3D 视图（相机坐标系：x 右、y 下、z 前）。"""
-    import matplotlib
+def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal, plane_d, person_points=None) -> str:
+    """相机视角 + 世界 3D 视角拼合对比图（单张 PNG，左右两面板）。
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    pts = inlier_points
-    if len(pts) > 8000:
-        pts = pts[np.random.default_rng(1).choice(len(pts), 8000, replace=False)]
-    fig = plt.figure(figsize=(7, 6), dpi=110)
-    ax = fig.add_subplot(111, projection="3d")
-    ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=1.5, c=pts[:, 2], cmap="viridis", alpha=0.4)
-    grid = plane_points.reshape(grid_steps, grid_steps, 3)
-    ax.plot_surface(grid[:, :, 0], grid[:, :, 1], grid[:, :, 2], color="orange", alpha=0.4)
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("y (m)")
-    ax.set_zlabel("z (m)")
-    ax.set_title("ground plane (camera height %.2f m)" % camera_height_m)
-    ax.view_init(elev=15, azim=-135)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="PNG", bbox_inches="tight")
-    plt.close(fig)
-    return _to_data_uri(buf)
-
-
-def _world3d_png(depth, intrinsics, inlier_points, plane_grid, plane_normal, plane_d) -> str:
-    """世界 3D 视角：地面法向量对齐到 -z，地面 z=0、物体离地高度为正（与 instance_ground_views 一致）。
-
-    - scene 点云按离地高度着色（viridis）
-    - 地面内点（绿）、拟合地面平面（红网格）、相机位置（红星）
-    - 采样反投影，避免大图全量反投影的内存峰值
+    - 左：相机坐标系（x 右、y 下、z 前），场景点云按深度着色，相机位于原点（红星）
+    - 右：世界坐标系（地面 z=0、法向量朝上），场景点云按离地高度着色，相机（红星）+ 法向箭头
+    - 两面板都叠加：地面内点（绿）、拟合地面平面（橙/红网格）、人物点云（黄）
     """
     import matplotlib
 
@@ -229,7 +203,7 @@ def _world3d_png(depth, intrinsics, inlier_points, plane_grid, plane_normal, pla
         vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=float)
         return np.eye(3) + vx + vx @ vx * ((1 - c) / s**2)
 
-    # 采样场景点（不生成全量 HxWx3 数组）
+    # 采样场景点（相机坐标系，不生成全量 HxWx3 数组）
     h, w = depth.shape
     valid = np.isfinite(depth) & (depth > 0)
     idx = np.flatnonzero(valid.ravel())
@@ -241,37 +215,108 @@ def _world3d_png(depth, intrinsics, inlier_points, plane_grid, plane_normal, pla
     z = depth.ravel()[idx]
     scene = np.stack([(cols - cx) * z / fx, (rows - cy) * z / fy, z], axis=-1)
 
-    # 相机系 -> 世界系
+    # 内点 / 人物点云采样
+    rng = np.random.default_rng(1)
+    in_pts = np.asarray(inlier_points, dtype=float)
+    if len(in_pts) > 30_000:
+        in_pts = in_pts[rng.choice(len(in_pts), 30_000, replace=False)]
+    per_pts = None
+    if person_points is not None and len(person_points):
+        per_pts = np.asarray(person_points, dtype=float)
+        if len(per_pts) > 20_000:
+            per_pts = per_pts[rng.choice(len(per_pts), 20_000, replace=False)]
+
+    # 相机系 -> 世界系（地面对齐到 z=0）
     R = rotate_to_up(np.asarray(plane_normal, dtype=float))
     wscene = scene @ R.T
-    win = np.asarray(inlier_points, dtype=float) @ R.T
+    win = in_pts @ R.T
     wground = np.asarray(plane_grid, dtype=float) @ R.T
     wscene[:, 2] -= plane_d
     win[:, 2] -= plane_d
     wground[:, 2] -= plane_d
     cam_world = np.array([0.0, 0.0, -plane_d], dtype=float)
-
-    n_in = min(80_000, len(win))
-    if len(win) > n_in:
-        win = win[np.random.default_rng(1).choice(len(win), n_in, replace=False)]
+    wper = per_pts @ R.T if per_pts is not None else None
+    if wper is not None:
+        wper[:, 2] -= plane_d
 
     zmin, zmax = np.percentile(wscene[:, 2], [2, 98])
-    fig = plt.figure(figsize=(10.5, 9), dpi=100)
-    ax = fig.add_subplot(111, projection="3d")
-    ax.scatter(wscene[:, 0], wscene[:, 1], wscene[:, 2], c=wscene[:, 2], cmap="viridis",
-               s=0.4, alpha=0.35, vmin=zmin, vmax=zmax)
-    ax.scatter(win[:, 0], win[:, 1], win[:, 2], c="#2ef05c", s=0.6, alpha=0.55)
-    ax.plot_surface(wground[:, :, 0], wground[:, :, 1], wground[:, :, 2], color="red", alpha=0.45)
+    cam_height = abs(float(plane_d))
+
+    # 相机视锥（表示相机位置与观察角度）：相机系 +z 为观察方向，按内参把图像四角
+    # 投影到 frustum_z 处作为近平面，转世界系后从相机位置向四个角拉棱线。
+    fz = 0.6  # 视锥长度（米）
+    hh, ww = float(depth.shape[0]), float(depth.shape[1])
+    fc_cam = np.array([
+        [(0 - cx) * fz / fx, (0 - cy) * fz / fy, fz],
+        [(ww - cx) * fz / fx, (0 - cy) * fz / fy, fz],
+        [(ww - cx) * fz / fx, (hh - cy) * fz / fy, fz],
+        [(0 - cx) * fz / fx, (hh - cy) * fz / fy, fz],
+    ])
+    fc_world = fc_cam @ R.T
+    fwd_world = R @ np.array([0.0, 0.0, 1.0])  # 世界系下的相机观察方向（原 +z）
+
+    fig = plt.figure(figsize=(16, 7.2), dpi=100)
+
+    # 左：相机视角
+    ax_cam = fig.add_subplot(121, projection="3d")
+    ax_cam.scatter(scene[:, 0], scene[:, 1], scene[:, 2], c=scene[:, 2], cmap="viridis", s=0.4, alpha=0.3)
+    ax_cam.scatter(in_pts[:, 0], in_pts[:, 1], in_pts[:, 2], c="#2ef05c", s=0.7, alpha=0.5)
+    if per_pts is not None:
+        ax_cam.scatter(per_pts[:, 0], per_pts[:, 1], per_pts[:, 2], c="#f7c948", s=1.0, alpha=0.7)
+    cam_grid = np.asarray(plane_grid, dtype=float)
+    ax_cam.plot_surface(cam_grid[:, :, 0], cam_grid[:, :, 1], cam_grid[:, :, 2], color="orange", alpha=0.4)
+    # 相机视锥：顶点在原点，观察方向 +z，近平面为图像四角
+    for j in range(4):
+        ax_cam.plot([0.0, fc_cam[j, 0]], [0.0, fc_cam[j, 1]], [0.0, fc_cam[j, 2]], color="#00e5ff", lw=1.0)
+    for j in range(4):
+        k = (j + 1) % 4
+        ax_cam.plot([fc_cam[j, 0], fc_cam[k, 0]], [fc_cam[j, 1], fc_cam[k, 1]], [fc_cam[j, 2], fc_cam[k, 2]], color="#00e5ff", lw=1.2)
+    ax_cam.quiver(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, length=0.45, color="#0066ff", arrow_length_ratio=0.25)
+    ax_cam.scatter([0.0], [0.0], [0.0], c="red", s=40, marker="*")
+    ax_cam.set_xlabel("x (m)")
+    ax_cam.set_ylabel("y (m)")
+    ax_cam.set_zlabel("z (m)")
+    ax_cam.set_title("camera view | cam at origin, %.2f m above plane" % cam_height, fontsize=11)
+    ax_cam.view_init(elev=15, azim=-135)
+
+    # 右：世界 3D
+    ax_w = fig.add_subplot(122, projection="3d")
+    ax_w.scatter(wscene[:, 0], wscene[:, 1], wscene[:, 2], c=wscene[:, 2], cmap="viridis",
+                 s=0.4, alpha=0.35, vmin=zmin, vmax=zmax)
+    ax_w.scatter(win[:, 0], win[:, 1], win[:, 2], c="#2ef05c", s=0.6, alpha=0.55)
+    if wper is not None:
+        ax_w.scatter(wper[:, 0], wper[:, 1], wper[:, 2], c="#f7c948", s=1.0, alpha=0.7)
+    ax_w.plot_surface(wground[:, :, 0], wground[:, :, 1], wground[:, :, 2], color="red", alpha=0.45)
     center = win.mean(axis=0)
-    ax.quiver(center[0], center[1], center[2], 0, 0, 1, length=1.5, color="k", arrow_length_ratio=0.15)
-    ax.scatter([cam_world[0]], [cam_world[1]], [cam_world[2]], c="red", s=60, marker="*")
-    ax.set_xlabel("world x (m)")
-    ax.set_ylabel("world y (m)")
-    ax.set_zlabel("height above ground (m)")
-    ax.set_title("GROUND in world 3D | ground at z=0, normal->up", fontsize=12)
-    ax.set_box_aspect((1, 1, 1))
-    ax.view_init(elev=25, azim=-60)
-    fig.tight_layout()
+    ax_w.quiver(center[0], center[1], center[2], 0, 0, 1, length=1.5, color="k", arrow_length_ratio=0.15)
+    # 相机视锥：顶点在世界系相机位置，棱线沿图像四角张开，蓝箭头为观察方向
+    for j in range(4):
+        ax_w.plot([cam_world[0], fc_world[j, 0]], [cam_world[1], fc_world[j, 1]], [cam_world[2], fc_world[j, 2]], color="#00e5ff", lw=1.0)
+    for j in range(4):
+        k = (j + 1) % 4
+        ax_w.plot([fc_world[j, 0], fc_world[k, 0]], [fc_world[j, 1], fc_world[k, 1]], [fc_world[j, 2], fc_world[k, 2]], color="#00e5ff", lw=1.2)
+    ax_w.quiver(cam_world[0], cam_world[1], cam_world[2], fwd_world[0], fwd_world[1], fwd_world[2],
+                length=0.45, color="#0066ff", arrow_length_ratio=0.25)
+    ax_w.scatter([cam_world[0]], [cam_world[1]], [cam_world[2]], c="red", s=40, marker="*")
+    ax_w.set_xlabel("world x (m)")
+    ax_w.set_ylabel("world y (m)")
+    ax_w.set_zlabel("height above ground (m)")
+    ax_w.set_title("world 3D | ground at z=0, normal -> up", fontsize=11)
+    ax_w.set_box_aspect((1, 1, 1))
+    ax_w.view_init(elev=25, azim=-60)
+
+    from matplotlib.lines import Line2D
+
+    handles = [
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#2ef05c", markersize=6, label="ground inliers"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#f7c948", markersize=6, label="person cloud"),
+        Line2D([0], [0], color="#00e5ff", lw=2, label="camera (view frustum)"),
+        Line2D([0], [0], color="red", lw=2, label="fitted plane"),
+    ]
+    if per_pts is None:
+        handles = [h for h in handles if "person cloud" not in h.get_label()]
+    fig.legend(handles=handles, loc="lower center", ncol=4, frameon=False, fontsize=10)
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
     buf = io.BytesIO()
     fig.savefig(buf, format="PNG", bbox_inches="tight")
     plt.close(fig)
@@ -437,16 +482,22 @@ def create_ground_app(
 
         visualization = None
         if request.visualize:
+            person_pts_viz = None
+            if person_mask is not None and person_mask.any():
+                person_pts_viz = result["points"][person_mask]
+                person_pts_viz = person_pts_viz[np.isfinite(person_pts_viz).all(axis=-1)]
+                if len(person_pts_viz) > 20_000:
+                    person_pts_viz = person_pts_viz[np.random.default_rng(0).choice(len(person_pts_viz), 20_000, replace=False)]
             visualization = {
                 "overlay": _overlay_png(rgb, floor_mask, result["plane_inlier_mask"], person_mask, contact_mask),
-                "cloud": _cloud_png(inliers_arr, grid, request.grid_steps, abs(float(result["plane_d"]))),
-                "world_3d": _world3d_png(
+                "views": _ground_views_png(
                     depth,
                     intrinsics,
                     result["plane_inlier_points"],
                     grid,
                     result["plane_normal"],
                     float(result["plane_d"]),
+                    person_pts_viz,
                 ),
             }
 
