@@ -175,12 +175,13 @@ def _overlay_png(rgb, floor_mask, inlier_mask, person_mask=None, contact_mask=No
     return _to_data_uri(buf)
 
 
-def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal, plane_d, person_points=None) -> str:
+def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal, plane_d, person_points=None, grid_steps=100, person_bbox_cam=None) -> str:
     """相机视角 + 世界 3D 视角拼合对比图（单张 PNG，左右两面板）。
 
     - 左：相机坐标系（x 右、y 下、z 前），场景点云按深度着色，相机位于原点（红星）
     - 右：世界坐标系（地面 z=0、法向量朝上），场景点云按离地高度着色，相机（红星）+ 法向箭头
-    - 两面板都叠加：地面内点（绿）、拟合地面平面（橙/红网格）、人物点云（黄）
+    - 两面板都叠加：地面内点（绿）、拟合地面平面（红网格）、人物点云（黄）
+    - person_bbox_cam：人物 3D 轴对齐 bbox（相机系 [xmin,ymin,zmin,xmax,ymax,zmax]），画品红线框
     """
     import matplotlib
 
@@ -189,6 +190,39 @@ def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal
 
     fx, cx = float(intrinsics[0, 0]), float(intrinsics[0, 2])
     fy, cy = float(intrinsics[1, 1]), float(intrinsics[1, 2])
+
+    # 重建平面网格：范围覆盖内点区域并外扩到"图像四角射线与拟合平面的交点"，
+    # 使渲染平面铺满相机视野内的地面，避免网格只覆盖内点中心区域而与点云地面"不重合"。
+    n_pl = np.asarray(plane_normal, dtype=float)
+    d_pl = float(plane_d)
+    basis_seed = np.eye(3)[np.argmin(np.abs(n_pl))]
+    axis_u = np.cross(n_pl, basis_seed)
+    axis_u /= np.linalg.norm(axis_u)
+    axis_v = np.cross(n_pl, axis_u)
+    in_pts0 = np.asarray(inlier_points, dtype=float)
+    ctr0 = in_pts0.mean(axis=0)
+    h0, w0 = float(depth.shape[0]), float(depth.shape[1])
+    corners = np.array([
+        [(0.0 - cx) / fx, (0.0 - cy) / fy, 1.0],
+        [(w0 - cx) / fx, (0.0 - cy) / fy, 1.0],
+        [(w0 - cx) / fx, (h0 - cy) / fy, 1.0],
+        [(0.0 - cx) / fx, (h0 - cy) / fy, 1.0],
+    ])
+    t_c = -d_pl / np.maximum(corners @ n_pl, 1e-9)  # 平面 n·p+d=0，射线交点 t=-d/(n·dir)
+    # 只保留与地面真正相交且距离合理的角点（t 极大≈视线与地面平行，属远处地平线，忽略）
+    keep = np.isfinite(t_c) & (t_c > 0) & (t_c <= 25.0)
+    corner_pts = corners[keep] * t_c[keep][:, None]
+    all_pts = np.vstack([in_pts0, corner_pts]) if len(corner_pts) else in_pts0
+    # uv 必须以质心 ctr0 为基准（网格展开 plane_grid = ctr0 + uu·axis_u + vv·axis_v），
+    # 若直接用 all_pts @ axis_u（相对光心原点），uv 区间会整体平移 ctr0 在平面上的投影，
+    # 导致网格与点云地面错位约 1.8m（渲染"不在同一高度"的根因）。
+    all_uv = np.column_stack(((all_pts - ctr0) @ axis_u, (all_pts - ctr0) @ axis_v))
+    u0, u1 = all_uv[:, 0].min(), all_uv[:, 0].max()
+    v0, v1 = all_uv[:, 1].min(), all_uv[:, 1].max()
+    u_values = np.linspace(u0, u1, grid_steps)
+    v_values = np.linspace(v0, v1, grid_steps)
+    uu, vv = np.meshgrid(u_values, v_values)
+    plane_grid = ctr0 + uu[..., None] * axis_u + vv[..., None] * axis_v
 
     def rotate_to_up(n, up=(0.0, 0.0, -1.0)):
         """Rodrigues 旋转：把法向量 n 对齐到 up。"""
@@ -226,14 +260,37 @@ def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal
         if len(per_pts) > 20_000:
             per_pts = per_pts[rng.choice(len(per_pts), 20_000, replace=False)]
 
+    # 视觉对齐：把距拟合平面很近的点云直接投影到平面上（p' = p - n·(n·p+d)），
+    # 消除深度噪声造成的"点云地面与渲染平面不在同一高度"观感。
+    # 内点容差 2cm，此处放宽到 12cm：诊断显示约 3% 的地面像素深度噪声在 5~25cm，
+    # 5cm 阈值压不掉这些"毛边"，12cm 可覆盖大部分深度噪声，又不会把沙发脚/低矮物体压平。
+    align_thresh = 0.12
+    for pts in (scene, in_pts):
+        signed = pts @ n_pl + d_pl
+        mask = np.abs(signed) <= align_thresh
+        if mask.any():
+            pts[mask] = pts[mask] - n_pl * signed[mask][:, None]
+
     # 相机系 -> 世界系（地面对齐到 z=0）
     R = rotate_to_up(np.asarray(plane_normal, dtype=float))
     wscene = scene @ R.T
     win = in_pts @ R.T
-    wground = np.asarray(plane_grid, dtype=float) @ R.T
     wscene[:, 2] -= plane_d
     win[:, 2] -= plane_d
-    wground[:, 2] -= plane_d
+    # 世界系地面网格：X/Y 范围直接取"点云地面带"(|z|<=0.2m)的范围，
+    # 避免 uv 轴对齐矩形转世界系后四角外扩出点云地面一大圈（用户反馈线框 X/Y 与点云不匹配）。
+    gm = np.abs(wscene[:, 2]) <= 0.20
+    if gm.sum() >= 4:
+        pad = 0.02  # 2% 边距让线框清晰可见且紧贴点云
+        gx0, gx1 = wscene[gm, 0].min(), wscene[gm, 0].max()
+        gy0, gy1 = wscene[gm, 1].min(), wscene[gm, 1].max()
+        dx, dy = (gx1 - gx0) * pad, (gy1 - gy0) * pad
+        gxx, gyy = np.meshgrid(np.linspace(gx0 - dx, gx1 + dx, grid_steps),
+                               np.linspace(gy0 - dy, gy1 + dy, grid_steps))
+        wground = np.stack([gxx, gyy, np.zeros_like(gxx)], axis=-1)
+    else:  # 兜底：无地面带时退回 uv 矩形
+        wground = np.asarray(plane_grid, dtype=float) @ R.T
+        wground[:, 2] -= plane_d
     cam_world = np.array([0.0, 0.0, -plane_d], dtype=float)
     wper = per_pts @ R.T if per_pts is not None else None
     if wper is not None:
@@ -242,9 +299,21 @@ def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal
     zmin, zmax = np.percentile(wscene[:, 2], [2, 98])
     cam_height = abs(float(plane_d))
 
+    # 人物 bbox：12 条边（8 角点索引对）。左面板用相机系轴对齐 bbox；
+    # 右面板在世界系下对人物点云重新取 min/max 做轴对齐 bbox（方向与地面网格一致）。
+    box_edges = [
+        (0, 1), (1, 3), (3, 2), (2, 0),  # 底面
+        (4, 5), (5, 7), (7, 6), (6, 4),  # 顶面
+        (0, 4), (1, 5), (2, 6), (3, 7),  # 竖棱
+    ]
+    box_corners = None
+    if person_bbox_cam is not None:
+        x0, y0, z0, x1, y1, z1 = map(float, person_bbox_cam)
+        box_corners = np.array([[x, y, z] for z in (z0, z1) for y in (y0, y1) for x in (x0, x1)], dtype=float)
+
     # 相机视锥（表示相机位置与观察角度）：相机系 +z 为观察方向，按内参把图像四角
     # 投影到 frustum_z 处作为近平面，转世界系后从相机位置向四个角拉棱线。
-    fz = 0.6  # 视锥长度（米）
+    fz = 0.9  # 视锥长度（米）
     hh, ww = float(depth.shape[0]), float(depth.shape[1])
     fc_cam = np.array([
         [(0 - cx) * fz / fx, (0 - cy) * fz / fy, fz],
@@ -252,7 +321,9 @@ def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal
         [(ww - cx) * fz / fx, (hh - cy) * fz / fy, fz],
         [(0 - cx) * fz / fx, (hh - cy) * fz / fy, fz],
     ])
+    # fc_cam 是相对光心的偏移；转世界系后需要与点云一致地做 z 平移（地面 z=0）
     fc_world = fc_cam @ R.T
+    fc_world[:, 2] -= plane_d
     fwd_world = R @ np.array([0.0, 0.0, 1.0])  # 世界系下的相机观察方向（原 +z）
 
     fig = plt.figure(figsize=(16, 7.2), dpi=100)
@@ -264,29 +335,69 @@ def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal
     if per_pts is not None:
         ax_cam.scatter(per_pts[:, 0], per_pts[:, 1], per_pts[:, 2], c="#f7c948", s=1.0, alpha=0.7)
     cam_grid = np.asarray(plane_grid, dtype=float)
-    ax_cam.plot_surface(cam_grid[:, :, 0], cam_grid[:, :, 1], cam_grid[:, :, 2], color="orange", alpha=0.4)
-    # 相机视锥：顶点在原点，观察方向 +z，近平面为图像四角
+    # 与右面板一致：低透明度红色面 + 红色网格线框
+    ax_cam.plot_surface(cam_grid[:, :, 0], cam_grid[:, :, 1], cam_grid[:, :, 2], color="red", alpha=0.16)
+    ax_cam.plot_wireframe(cam_grid[::5, ::5, 0], cam_grid[::5, ::5, 1], cam_grid[::5, ::5, 2],
+                          color="red", alpha=0.85, lw=0.5)
+    # 人物 3D bbox 线框（相机系）
+    if box_corners is not None:
+        for a, b in box_edges:
+            ax_cam.plot([box_corners[a, 0], box_corners[b, 0]],
+                        [box_corners[a, 1], box_corners[b, 1]],
+                        [box_corners[a, 2], box_corners[b, 2]],
+                        color="#ff00ff", lw=1.6)
+    # 相机视锥：顶点在原点，近平面为图像四角
     for j in range(4):
         ax_cam.plot([0.0, fc_cam[j, 0]], [0.0, fc_cam[j, 1]], [0.0, fc_cam[j, 2]], color="#00e5ff", lw=1.0)
     for j in range(4):
         k = (j + 1) % 4
         ax_cam.plot([fc_cam[j, 0], fc_cam[k, 0]], [fc_cam[j, 1], fc_cam[k, 1]], [fc_cam[j, 2], fc_cam[k, 2]], color="#00e5ff", lw=1.2)
-    ax_cam.quiver(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, length=0.45, color="#0066ff", arrow_length_ratio=0.25)
     ax_cam.scatter([0.0], [0.0], [0.0], c="red", s=40, marker="*")
     ax_cam.set_xlabel("x (m)")
     ax_cam.set_ylabel("y (m)")
     ax_cam.set_zlabel("z (m)")
     ax_cam.set_title("camera view | cam at origin, %.2f m above plane" % cam_height, fontsize=11)
-    ax_cam.view_init(elev=15, azim=-135)
+    # 相机视角渲染：观察者位于相机（原点）后方沿光轴 +z 向前看，屏幕右 = +x、屏幕下 = +y
+    ax_cam.set_proj_type("persp", focal_length=0.55)
+    ax_cam.view_init(elev=-90, azim=-90, roll=0)
 
     # 右：世界 3D
     ax_w = fig.add_subplot(122, projection="3d")
-    ax_w.scatter(wscene[:, 0], wscene[:, 1], wscene[:, 2], c=wscene[:, 2], cmap="viridis",
-                 s=0.4, alpha=0.35, vmin=zmin, vmax=zmax)
+    # 场景点云按高度着色。地面带（|z|<=0.2m）是用户关心的区域，保持高亮；
+    # 高处物体（沙发/墙/桌，占约 73%）若同样用黄绿色会淹没红色平面、造成"平面与地面
+    # 不重合"的错觉，因此降为灰色低透明度背景。
+    wz = wscene[:, 2]
+    ground_mask = np.abs(wz) <= 0.20
+    if ground_mask.any() and (~ground_mask).any():
+        ax_w.scatter(wscene[~ground_mask, 0], wscene[~ground_mask, 1], wscene[~ground_mask, 2],
+                     c="#9a9a9a", s=0.3, alpha=0.18)
+        ax_w.scatter(wscene[ground_mask, 0], wscene[ground_mask, 1], wscene[ground_mask, 2],
+                     c=wz[ground_mask], cmap="viridis", s=0.5, alpha=0.55, vmin=zmin, vmax=zmax)
+    else:
+        ax_w.scatter(wscene[:, 0], wscene[:, 1], wscene[:, 2], c=wz, cmap="viridis",
+                     s=0.4, alpha=0.35, vmin=zmin, vmax=zmax)
     ax_w.scatter(win[:, 0], win[:, 1], win[:, 2], c="#2ef05c", s=0.6, alpha=0.55)
     if wper is not None:
         ax_w.scatter(wper[:, 0], wper[:, 1], wper[:, 2], c="#f7c948", s=1.0, alpha=0.7)
-    ax_w.plot_surface(wground[:, :, 0], wground[:, :, 1], wground[:, :, 2], color="red", alpha=0.45)
+    # 人物 3D bbox：世界系下对人物点云重新做轴对齐包围盒（方向与地面网格一致），
+    # 而非旋转相机系 bbox（会变成斜盒且范围失真）。
+    if wper is not None and len(wper) >= 8:
+        wx0, wy0, wz0 = wper[:, 0].min(), wper[:, 1].min(), wper[:, 2].min()
+        wx1, wy1, wz1 = wper[:, 0].max(), wper[:, 1].max(), wper[:, 2].max()
+        wbc = np.array([[x, y, z] for z in (wz0, wz1) for y in (wy0, wy1) for x in (wx0, wx1)], dtype=float)
+        for a, b in box_edges:
+            ax_w.plot([wbc[a, 0], wbc[b, 0]], [wbc[a, 1], wbc[b, 1]], [wbc[a, 2], wbc[b, 2]],
+                      color="#ff00ff", lw=1.6)
+    elif box_corners is not None:  # 兜底：无世界系人物点云时退回相机系 bbox 旋转版
+        wbox = box_corners @ R.T
+        wbox[:, 2] -= plane_d
+        for a, b in box_edges:
+            ax_w.plot([wbox[a, 0], wbox[b, 0]], [wbox[a, 1], wbox[b, 1]], [wbox[a, 2], wbox[b, 2]],
+                      color="#ff00ff", lw=1.6)
+    # 平面：低透明度面 + 红色网格线框，线框让"拟合平面"的范围与贴合关系一目了然
+    ax_w.plot_surface(wground[:, :, 0], wground[:, :, 1], wground[:, :, 2], color="red", alpha=0.16)
+    ax_w.plot_wireframe(wground[::5, ::5, 0], wground[::5, ::5, 1], wground[::5, ::5, 2],
+                        color="red", alpha=0.85, lw=0.5)
     center = win.mean(axis=0)
     ax_w.quiver(center[0], center[1], center[2], 0, 0, 1, length=1.5, color="k", arrow_length_ratio=0.15)
     # 相机视锥：顶点在世界系相机位置，棱线沿图像四角张开，蓝箭头为观察方向
@@ -296,13 +407,15 @@ def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal
         k = (j + 1) % 4
         ax_w.plot([fc_world[j, 0], fc_world[k, 0]], [fc_world[j, 1], fc_world[k, 1]], [fc_world[j, 2], fc_world[k, 2]], color="#00e5ff", lw=1.2)
     ax_w.quiver(cam_world[0], cam_world[1], cam_world[2], fwd_world[0], fwd_world[1], fwd_world[2],
-                length=0.45, color="#0066ff", arrow_length_ratio=0.25)
+                length=0.9, color="#0066ff", arrow_length_ratio=0.25, lw=2.0)
     ax_w.scatter([cam_world[0]], [cam_world[1]], [cam_world[2]], c="red", s=40, marker="*")
     ax_w.set_xlabel("world x (m)")
     ax_w.set_ylabel("world y (m)")
     ax_w.set_zlabel("height above ground (m)")
     ax_w.set_title("world 3D | ground at z=0, normal -> up", fontsize=11)
     ax_w.set_box_aspect((1, 1, 1))
+    # 透视投影：focal 越小视场角越大、近大远小越明显（默认 1 仅约 90° 视场）
+    ax_w.set_proj_type("persp", focal_length=0.55)
     ax_w.view_init(elev=25, azim=-60)
 
     from matplotlib.lines import Line2D
@@ -498,6 +611,8 @@ def create_ground_app(
                     result["plane_normal"],
                     float(result["plane_d"]),
                     person_pts_viz,
+                    request.grid_steps,
+                    person_bbox_3d_m,
                 ),
             }
 
