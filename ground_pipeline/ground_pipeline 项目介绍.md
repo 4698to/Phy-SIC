@@ -83,7 +83,7 @@ flowchart TD
     L -- 是 --> N["LangSAM 人物分割 → 人物点云<br/>3D bbox / 质心"]
     N --> O["接触区域检测<br/>人物点与平面距离 ≤ 阈值"]
     N --> M
-    M --> P["组装响应<br/>plane_normal / plane_d / camera_height<br/>plane_points / inlier_points<br/>person_* / contact_*"]
+    M --> P["组装响应（向后兼容）<br/>顶层旧字段 plane_normal / plane_d / camera_height<br/>plane_points / inlier_points / person_* / contact_*<br/>+ 两系分组 camera（相机系）/ world（世界系）<br/>各组含 ground 地面信息 / camera 相机信息 / person bbox / contact"]
     P --> Q{"visualize=true?"}
     Q -- 是 --> R["渲染 overlay 覆盖图<br/>+ 相机/世界 3D 双面板图"]
     Q -- 否 --> S["返回 JSON"]
@@ -151,18 +151,22 @@ z = depth(u, v)
 
 `/v1/ground` 关键参数：`image`（必填，Base64 data URI / URL / 路径）、`floor_prompt`、`person_prompt`（空串跳过人物分析）、`contact_threshold`、`distance_threshold`、`iterations`、`grid_steps`、`return_data`、`visualize`。
 
-主要响应字段：
+主要响应字段（**顶层旧字段全部保留，向后兼容**；新接入方建议使用两系分组）：
 
 | 字段 | 说明 |
 |---|---|
-| `plane_normal` / `plane_d` | 地面平面方程（相机系） |
+| `camera` | **相机系分组**：`ground`（地面信息）/ `camera`（相机内参、焦距、高度）/ `person`（人物点云 bbox、质心）/ `contact`（接触区域） |
+| `world` | **世界系分组**：同样四个子对象。地面平面为 `z=0`、`z` 轴向上、法向 `≈(0,0,-1)`；`camera` 含 `position_m` / `forward`（相机世界系位姿）；`person.bbox_3d_m` 为世界系轴对齐包围盒 |
+| `plane_normal` / `plane_d` | 地面平面方程（相机系，旧字段） |
 | `camera_height_m` | 相机到地面高度 ≈ `abs(plane_d)` |
 | `focal_px` | DepthPro 估计焦距 |
 | `plane_points` / `inlier_points` | 地面网格采样 / 内点采样（相机系，米） |
-| `person_bbox_3d_m` / `person_centroid_m` | 人物 3D 轴对齐包围盒 / 质心 |
+| `person_bbox_3d_m` / `person_centroid_m` | 人物 3D 轴对齐包围盒 / 质心（相机系，旧字段） |
 | `contact_pixels` / `contact_centroid_m` / `contact_bbox` | 人物-地面接触区域统计 |
-| `masks` / `person_points` / `depth_b64` | 仅 `return_data=true`：四张 mask PNG、人物点云采样、全量深度 `.npy` |
+| `masks` / `person_points` / `depth_b64` | **默认关闭返回**，仅 `return_data=true`：四张 mask PNG、人物点云采样、全量深度 `.npy` |
 | `visualization` | 仅 `visualize=true`：`overlay` + `views` 两张 PNG data URI |
+
+> 两系换算：`wpts = cam_pts @ R.T`，`wpts[:,2] -= plane_d`，其中 `R = rotate_to_up(plane_normal, (0,0,-1))`。详细字段结构见 [GROUND_SERVICE_API.md](file:///G:/UGit/Phy-SIC/ground_pipeline/GROUND_SERVICE_API.md) 的"两系分组输出"。
 
 ---
 

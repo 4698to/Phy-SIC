@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 
 import depth_pro
 from lang_sam import LangSAM
@@ -76,6 +76,18 @@ class GroundResult(BaseModel):
     person_points: Optional[List[List[float]]] = None
     depth_b64: Optional[str] = None
     visualization: Optional[Dict[str, str]] = None
+    # 相机系 / 世界系分组输出（顶层旧字段保留，向后兼容）
+    camera: Optional[Dict[str, Any]] = None
+    world: Optional[Dict[str, Any]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        """默认关闭字段：masks / person_points / depth_b64 为 None 时不出现在 JSON 响应中（仅 return_data=true 时返回）。"""
+        data = handler(self)
+        for _field in ("masks", "person_points", "depth_b64"):
+            if data.get(_field) is None:
+                data.pop(_field, None)
+        return data
 
 
 def _load_image(source: str):
@@ -175,6 +187,66 @@ def _overlay_png(rgb, floor_mask, inlier_mask, person_mask=None, contact_mask=No
     return _to_data_uri(buf)
 
 
+def rotate_to_up(n, up=(0.0, 0.0, -1.0)):
+    """Rodrigues 旋转：把法向量 n 对齐到 up。"""
+    n = n / np.linalg.norm(n)
+    up = np.asarray(up, dtype=float)
+    up = up / np.linalg.norm(up)
+    v = np.cross(n, up)
+    s = np.linalg.norm(v)
+    c = float(np.dot(n, up))
+    if s < 1e-9:
+        return np.eye(3) if c > 0 else -np.eye(3)
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=float)
+    return np.eye(3) + vx + vx @ vx * ((1 - c) / s**2)
+
+
+def _world_frame_data(
+    *,
+    plane_normal,
+    plane_d: float,
+    plane_points,
+    inlier_points,
+    person_points=None,
+    contact_points=None,
+) -> dict:
+    """相机系数据 -> 世界系（地面 z=0、法向朝上），供接口 world 分组输出。
+
+    返回字典（值为 ndarray / float）：
+      rotation / plane_normal / plane_d(=0) / plane_points / inlier_points
+      camera_position / camera_forward / camera_height_m
+      person_points / person_bbox_3d_m / person_centroid_m / contact_centroid_m
+    """
+    R = rotate_to_up(np.asarray(plane_normal, dtype=float))
+    d = float(plane_d)
+    w_plane = np.asarray(plane_points, dtype=float) @ R.T
+    w_plane[:, 2] -= d
+    w_in = np.asarray(inlier_points, dtype=float) @ R.T
+    w_in[:, 2] -= d
+    out = {
+        "rotation": R,
+        "plane_normal": (R @ np.asarray(plane_normal, dtype=float)).astype(float),
+        "plane_d": 0.0,
+        "plane_points": w_plane,
+        "inlier_points": w_in,
+        "camera_position": np.array([0.0, 0.0, -d], dtype=float),
+        "camera_forward": (R @ np.array([0.0, 0.0, 1.0])).astype(float),
+        "camera_height_m": abs(d),
+    }
+    if person_points is not None and len(person_points):
+        wp = np.asarray(person_points, dtype=float) @ R.T
+        wp[:, 2] -= d
+        mn, mx = wp.min(axis=0), wp.max(axis=0)
+        out["person_points"] = wp
+        out["person_bbox_3d_m"] = np.array([mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]], dtype=float)
+        out["person_centroid_m"] = wp.mean(axis=0).astype(float)
+    if contact_points is not None and len(contact_points):
+        wc = np.asarray(contact_points, dtype=float) @ R.T
+        wc[:, 2] -= d
+        out["contact_centroid_m"] = wc.mean(axis=0).astype(float)
+    return out
+
+
 def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal, plane_d, person_points=None, grid_steps=100, person_bbox_cam=None) -> str:
     """相机视角 + 世界 3D 视角拼合对比图（单张 PNG，左右两面板）。
 
@@ -223,19 +295,6 @@ def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal
     v_values = np.linspace(v0, v1, grid_steps)
     uu, vv = np.meshgrid(u_values, v_values)
     plane_grid = ctr0 + uu[..., None] * axis_u + vv[..., None] * axis_v
-
-    def rotate_to_up(n, up=(0.0, 0.0, -1.0)):
-        """Rodrigues 旋转：把法向量 n 对齐到 up。"""
-        n = n / np.linalg.norm(n)
-        up = np.asarray(up, dtype=float)
-        up = up / np.linalg.norm(up)
-        v = np.cross(n, up)
-        s = np.linalg.norm(v)
-        c = float(np.dot(n, up))
-        if s < 1e-9:
-            return np.eye(3) if c > 0 else -np.eye(3)
-        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=float)
-        return np.eye(3) + vx + vx @ vx * ((1 - c) / s**2)
 
     # 采样场景点（相机坐标系，不生成全量 HxWx3 数组）
     h, w = depth.shape
@@ -616,13 +675,103 @@ def create_ground_app(
                 ),
             }
 
+        # ---- 相机系 / 世界系分组输出（顶层旧字段保留，向后兼容）----
+        intrinsics_list = [
+            [float(f_px), 0.0, float(width / 2)],
+            [0.0, float(f_px), float(height / 2)],
+            [0.0, 0.0, 1.0],
+        ]
+        depth_range_m = [float(np.nanmin(depth)), float(np.nanmax(depth))]
+        cam_ground = {
+            "plane_normal": result["plane_normal"].astype(float).tolist(),
+            "plane_d": float(result["plane_d"]),
+            "camera_height_m": abs(float(result["plane_d"])),
+            "plane_points": grid.reshape(-1, 3).astype(float).tolist(),
+            "inlier_points": inliers_arr.astype(float).tolist(),
+        }
+        cam_info = {
+            "focal_px": f_px,
+            "intrinsics": intrinsics_list,
+            "depth_range_m": depth_range_m,
+            "image_hw": [height, width],
+            "height_m": abs(float(result["plane_d"])),
+        }
+        cam_person = None
+        if person_mask is not None and person_mask.any():
+            cam_person = {
+                "pixels": int(person_mask.sum()),
+                "bbox_3d_m": person_bbox_3d_m,
+                "centroid_m": person_centroid_m,
+                "points": person_points,  # return_data=true 时为相机系采样点云
+            }
+        cam_contact = None
+        if contact_mask is not None:
+            cam_contact = {
+                "pixels": contact_pixels,
+                "centroid_m": contact_centroid_m,
+                "bbox": contact_bbox,
+            }
+
+        # 世界系：人物/接触用全量有效点变换（bbox/质心更准确），points 输出用 return_data 采样
+        full_person_pts = None
+        if person_mask is not None and person_mask.any():
+            fp = result["points"][person_mask]
+            fp = fp[np.isfinite(fp).all(axis=-1)]
+            full_person_pts = fp
+        contact_full = None
+        if contact_mask is not None:
+            contact_full = result["points"][contact_mask]
+        wf = _world_frame_data(
+            plane_normal=result["plane_normal"],
+            plane_d=float(result["plane_d"]),
+            plane_points=grid.reshape(-1, 3),
+            inlier_points=result["plane_inlier_points"],
+            person_points=full_person_pts,
+            contact_points=contact_full,
+        )
+        world_ground = {
+            "plane_normal": wf["plane_normal"].tolist(),
+            "plane_d": wf["plane_d"],
+            "camera_height_m": wf["camera_height_m"],
+            "plane_points": wf["plane_points"].astype(float).tolist(),
+            "inlier_points": wf["inlier_points"].astype(float).tolist(),
+        }
+        world_cam = {
+            "focal_px": f_px,
+            "intrinsics": intrinsics_list,
+            "depth_range_m": depth_range_m,
+            "image_hw": [height, width],
+            "height_m": wf["camera_height_m"],
+            "position_m": wf["camera_position"].tolist(),
+            "forward": wf["camera_forward"].tolist(),
+        }
+        world_person = None
+        if cam_person is not None and "person_points" in wf:
+            wp_pts = None
+            if person_points is not None:
+                wp_pts = np.asarray(person_points, dtype=float) @ wf["rotation"].T
+                wp_pts[:, 2] -= float(result["plane_d"])
+                wp_pts = wp_pts.astype(float).tolist()
+            world_person = {
+                "pixels": cam_person["pixels"],
+                "bbox_3d_m": wf["person_bbox_3d_m"].tolist(),
+                "centroid_m": wf["person_centroid_m"].tolist(),
+                "points": wp_pts,
+            }
+        world_contact = None
+        if cam_contact is not None and "contact_centroid_m" in wf:
+            world_contact = {
+                "pixels": cam_contact["pixels"],
+                "centroid_m": wf["contact_centroid_m"].tolist(),
+            }
+
         return GroundResult(
             ok=True,
             plane_normal=result["plane_normal"].astype(float).tolist(),
             plane_d=float(result["plane_d"]),
             camera_height_m=abs(float(result["plane_d"])),
             focal_px=f_px,
-            depth_range_m=[float(np.nanmin(depth)), float(np.nanmax(depth))],
+            depth_range_m=depth_range_m,
             image_hw=[height, width],
             floor_pixels=int(floor_mask.sum()),
             plane_inliers=int(result["plane_inlier_mask"].sum()),
@@ -638,6 +787,18 @@ def create_ground_app(
             person_points=person_points,
             depth_b64=depth_b64,
             visualization=visualization,
+            camera={
+                "ground": cam_ground,
+                "camera": cam_info,
+                "person": cam_person,
+                "contact": cam_contact,
+            },
+            world={
+                "ground": world_ground,
+                "camera": world_cam,
+                "person": world_person,
+                "contact": world_contact,
+            },
         )
 
     return app

@@ -106,12 +106,82 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
 | `contact_pixels` | int \| null | 接触区域像素数：人物 mask 中反投影 3D 点距地面平面 ≤ `contact_threshold` 的像素。未启用人物分割时为 `null` |
 | `contact_centroid_m` | [x, y, z] \| null | 接触区域 3D 质心（相机坐标系，米），无接触时 `null` |
 | `contact_bbox` | [x1, y1, x2, y2] \| null | 接触区域在图像上的包围框（像素），无接触时 `null` |
-| `masks` | object \| null | 仅 `return_data=true`：`{"floor","inlier","person","contact"}`，各为 8-bit 灰度 PNG base64 data URI（0/255，可还原布尔数组）；`person`/`contact` 无对应数据时为 `null` |
-| `person_points` | `[[x,y,z], ...]` \| null | 仅 `return_data=true`：人物 mask 3D 点云采样（相机坐标系，米，≤`person_points_limit` 个） |
-| `depth_b64` | string \| null | 仅 `return_data=true`：全量深度图 float32 `.npy` 的 base64（`np.load(io.BytesIO(base64.b64decode(s)))` 还原） |
+| `masks` | object \| null | **默认关闭返回**，仅 `return_data=true`：`{"floor","inlier","person","contact"}`，各为 8-bit 灰度 PNG base64 data URI（0/255，可还原布尔数组）；`person`/`contact` 无对应数据时为 `null` |
+| `person_points` | `[[x,y,z], ...]` \| null | **默认关闭返回**，仅 `return_data=true`：人物 mask 3D 点云采样（相机坐标系，米，≤`person_points_limit` 个） |
+| `depth_b64` | string \| null | **默认关闭返回**，仅 `return_data=true`：全量深度图 float32 `.npy` 的 base64（`np.load(io.BytesIO(base64.b64decode(s)))` 还原） |
 | `plane_points` | `[[x,y,z], ...]` | 地面上网格采样点（`grid_steps²` 个，相机坐标系，米） |
 | `inlier_points` | `[[x,y,z], ...]` | 地面内点 3D 坐标采样（最多 2000 个，随机抽样，相机坐标系，米） |
+| `camera` | object | **相机系分组**（地面信息 / 相机信息 / 人物 bbox / 接触），见下方"两系分组输出" |
+| `world` | object | **世界系分组**（地面信息 / 相机信息 / 人物 bbox / 接触），见下方"两系分组输出" |
 | `visualization` | object \| null | 仅 `visualize=true` 时返回，见下方"可视化输出" |
+
+> 顶层旧字段（`plane_normal` / `plane_d` / `plane_points` / `inlier_points` / `person_bbox_3d_m` 等）**全部保留**，与 `camera` / `world` 分组并存，向后兼容。新接入方建议直接使用分组字段。
+
+#### 两系分组输出（`camera` / `world`）
+
+同一份几何数据按**相机坐标系**与**世界坐标系**分别组织，每个分组都含 `ground`（地面信息）、`camera`（相机信息）、`person`（人物点云 bbox）、`contact`（接触区域）四个子对象；`person` / `contact` 在未启用或未检出时为 `null`。
+
+```json
+{
+  "camera": {
+    "ground": {
+      "plane_normal": [0.021, -0.999, 0.017],   // 相机系单位法向量
+      "plane_d": -1.3142,                       // 相机系平面方程 n·p + d = 0 的 d
+      "camera_height_m": 1.3142,                // ≈ abs(plane_d)
+      "plane_points": [[0.12, -1.31, 1.02], "…共 grid_steps² 个"],
+      "inlier_points": [[0.08, -1.30, 1.01], "…共 ≤2000 个"]
+    },
+    "camera": {
+      "focal_px": 891.7,                        // 相机焦距（像素，fx=fy）
+      "intrinsics": [[891.7, 0.0, 200.0], [0.0, 891.7, 300.0], [0.0, 0.0, 1.0]],
+      "depth_range_m": [0.1, 8.7],
+      "image_hw": [600, 400],
+      "height_m": 1.3142                        // 相机离地高度（米）
+    },
+    "person": {
+      "pixels": 12345,                          // 人物 mask 像素数
+      "bbox_3d_m": [x1, y1, z1, x2, y2, z2],    // 相机系轴对齐包围盒（人物点云 x/y/z min/max）
+      "centroid_m": [x, y, z],                  // 相机系质心
+      "points": [[x, y, z], "…"]                // return_data=true 时：人物点云采样（相机系，≤person_points_limit）
+    },
+    "contact": {
+      "pixels": 1200,
+      "centroid_m": [x, y, z],
+      "bbox": [x1, y1, x2, y2]                  // 接触区域图像包围框（像素）
+    }
+  },
+  "world": {
+    "ground": {
+      "plane_normal": [0.0, 0.0, -1.0],         // ≈(0,0,-1)，指向地面下方
+      "plane_d": 0.0,                           // 恒为 0：地面即 z=0 平面
+      "camera_height_m": 1.3142,
+      "plane_points": [[x, y, 0.0], "…"],       // 世界系，z≈0
+      "inlier_points": [[x, y, 0.0], "…"]
+    },
+    "camera": {
+      "focal_px": 891.7,
+      "intrinsics": [[891.7, 0.0, 200.0], [0.0, 891.7, 300.0], [0.0, 0.0, 1.0]],
+      "depth_range_m": [0.1, 8.7],
+      "image_hw": [600, 400],
+      "height_m": 1.3142,
+      "position_m": [0.0, 0.0, 1.3142],         // 相机光心在世界系的位置（地面上方）
+      "forward": [0.0, 0.0, 1.0]                // 相机光轴方向（世界系单位向量）
+    },
+    "person": {
+      "pixels": 12345,
+      "bbox_3d_m": [x1, y1, z1, x2, y2, z2],    // 世界系轴对齐包围盒（对人物点云在世界系重新取 min/max，方向与地面网格一致）
+      "centroid_m": [x, y, z],                  // 世界系质心
+      "points": [[x, y, z], "…"]                // return_data=true 时：人物点云采样（世界系）
+    },
+    "contact": {
+      "pixels": 1200,
+      "centroid_m": [x, y, z]                   // 世界系（接触点贴近地面，z≈0）
+    }
+  }
+}
+```
+
+**世界系变换约定**：取 Rodrigues 旋转 `R` 将相机系地面法向量 `plane_normal` 对齐到 `(0,0,-1)`，即 `wpts = cam_pts @ R.T`，再对 `z` 减 `plane_d`。于是地面平面成为 `z=0`、法向 `(0,0,-1)`（指向地面下方）、**z 轴向上**；相机光心落在 `position_m = (0,0,-plane_d)`（地面上方 `camera_height_m` 处）。人物立于地面时世界系 bbox 的 `z` 范围从脚底 `≈0` 到头顶正值。
 
 #### 成功响应示例
 
@@ -128,6 +198,8 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
   "plane_inliers": 65624,
   "plane_points": [[0.12, -1.31, 1.02], "...（共 10000 个点）"],
   "inlier_points": [[0.08, -1.30, 1.01], "...（共 2000 个点）"],
+  "camera": { "ground": { "...": "相机系地面信息" }, "camera": { "...": "相机内参/高度" }, "person": { "...": "相机系人物 bbox" }, "contact": { "...": "相机系接触" } },
+  "world": { "ground": { "...": "世界系地面信息（z=0）" }, "camera": { "...": "相机位姿/高度" }, "person": { "...": "世界系人物 bbox" }, "contact": { "...": "世界系接触" } },
   "visualization": {
     "overlay": "data:image/png;base64,iVBORw0KGgo...",
     "views": "data:image/png;base64,iVBORw0KGgo..."
@@ -148,8 +220,9 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
 
 #### 坐标系约定
 
-- **相机坐标系**：原点在相机光心，`x` 向右，`y` 向下，`z` 向前（标准反投影 `x=(u-cx)·z/fx`，`y=(v-cy)·z/fy`），单位为**米**。
-- `plane_normal` 主分量被固定为正，因此**朝向可能指向地面也可能反向**；若需要朝上/朝下的朝向，请结合相机位姿或 `plane_d` 的符号自行归一化。
+- **相机坐标系**：原点在相机光心，`x` 向右，`y` 向下，`z` 向前（标准反投影 `x=(u-cx)·z/fx`，`y=(v-cy)·z/fy`），单位为**米**。顶层旧字段、`camera` 分组均使用该坐标系。
+- **世界坐标系**：由相机系经 `rotate_to_up(plane_normal, up=(0,0,-1))` 旋转 + 平移得到，地面平面为 `z=0`、**`z` 轴向上**、法向量 `≈(0,0,-1)`（指向地面下方）。`world` 分组使用该坐标系，`camera.position_m` 即相机光心（地面上方 `camera_height_m` 处）。
+- `plane_normal`（相机系）主分量被固定为正，因此**朝向可能指向地面也可能反向**；世界系 `world.ground.plane_normal` 已固定为 `≈(0,0,-1)`，无需再归一化。
 - `plane_points` / `inlier_points` 可直接用于：地面网格建图、相机高度校验、落地导航平面估计等。
 
 #### 错误响应
