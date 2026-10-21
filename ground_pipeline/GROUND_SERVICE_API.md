@@ -25,6 +25,7 @@ run_ground_pipeline.bat
 | `--sam-type` | `sam2.1_hiera_small` | SAM2 模型类型 |
 | `--sam-ckpt` | `data/sam2.1_hiera_small_langsam.pt` | SAM2 权重路径 |
 | `--floor-prompt` | `floor, wooden floor.` | 默认地面分割提示词 |
+| `--sam3d-resources` | 环境变量 `SAM3D_RESOURCES` | 可选 `ImagePose_Resources` 根目录；配置后尝试加载 SAM3D Body，姿势模块加载失败不影响地面服务 |
 
 > 注意：模型加载约需 **2 分钟**（DepthPro + LangSAM）。加载完成前 `/health` 返回 `ok: false`。服务必须等 `/health` 为 `ok: true` 后才可调用 `/v1/ground`。
 
@@ -66,7 +67,12 @@ run_ground_pipeline.bat
 | `grid_steps` | integer | 否 | `100` | 平面网格分辨率（返回 `grid_steps × grid_steps` 个平面采样点） |
 | `return_data` | bool | 否 | `false` | 为 `true` 时额外返回全量像素级数据：`masks`（四张 PNG base64）、`person_points`（人物点云采样）、`depth_b64`（全量深度 .npy base64）。响应体积明显增大，按需开启 |
 | `person_points_limit` | integer | 否 | `2000` | `return_data=true` 时人物点云采样上限 |
-| `visualize` | bool | 否 | `false` | 为 `true` 时返回可视化图片（见下方"可视化输出"） |
+| `visualize` | bool | 否 | `false` | 为 `true` 时返回可视化图片（见下方“可视化输出”） |
+| `pose_inference` | bool | 否 | `false` | 为 `true` 时，用人物 mask 派生单个图像坐标 2D bbox 并在进程内运行 SAM3D Body ViT-H；不运行 ViTPose。启用姿势模块需配置 `SAM3D_RESOURCES` 环境变量或 `--sam3d-resources` 参数；模块未就绪时响应中会说明姿势错误 |
+| `pose_want_overlay` | bool | 否 | `false` | 需同时设置 `pose_inference=true` 和 `visualize=true`；在 `visualization.pose_overlay` 中返回 SAM3D 2D 人体骨架叠加图，不改变原有地面 `overlay` |
+| `pose_want_mesh` | bool | 否 | `false` | 需同时设置 `pose_inference=true` 和 `visualize=true`；姿势推理成功时，在 `visualization.pose_mesh` 返回独立 SAM3D 网格多视图图，将完整预测网格放入 `visualization.views` 的相机系/世界系双面板，并额外在 `visualization.pose_world` 返回聚焦于地面世界坐标系的点云 + 网格 3D 渲染图。网格位置未与 DepthPro 点云完成米制配准，仅作视觉对照；独立世界图绘制失败只记录 `pose.mesh_error`，不影响地面结果或其他可视化图
+
+平面拟合内置**竖直面剔除**：相机系 y 轴向下，真实地面法向应满足 `|n_y| ≥ 0.5`（`min_vertical_component`，内部默认 0.5，允许约 60° 的俯仰）。分割掩码里的大面积背板/墙面属于竖直面，RANSAC 会跳过它们，SVD 精化后的平面也会再校验一次；若掩码内只剩竖直面，返回 `422 无法拟合水平地面平面`。该判据避免了「背景墙内点数最多、抢走地面」导致的 `camera_height_m` 异常（如 2.85 m）与后续网格配准被带偏。
 
 #### 请求示例
 
@@ -85,6 +91,11 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
 curl -X POST http://127.0.0.1:8001/v1/ground \
   -H "Content-Type: application/json" \
   -d '{"image": "data:image/jpeg;base64,...", "visualize": true}'
+
+# 方式四：姿势推理 + 2D 姿势叠加图 + SAM3D 3D 网格多视图图
+curl -X POST http://127.0.0.1:8001/v1/ground \
+  -H "Content-Type: application/json" \
+  -d '{"image": "data:image/jpeg;base64,...", "pose_inference": true, "pose_want_overlay": true, "pose_want_mesh": true, "visualize": true}'
 ```
 
 #### 响应字段
@@ -113,9 +124,34 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
 | `inlier_points` | `[[x,y,z], ...]` | 地面内点 3D 坐标采样（最多 2000 个，随机抽样，相机坐标系，米） |
 | `camera` | object | **相机系分组**（地面信息 / 相机信息 / 人物 bbox / 接触），见下方"两系分组输出" |
 | `world` | object | **世界系分组**（地面信息 / 相机信息 / 人物 bbox / 接触），见下方"两系分组输出" |
-| `visualization` | object \| null | 仅 `visualize=true` 时返回，见下方"可视化输出" |
+| `visualization` | object \| null | 仅 `visualize=true` 时返回，见下方“可视化输出” |
+| `pose` | object \| null | 仅 `pose_inference=true` 时返回；独立于地面坐标系，结构见下方“姿势输出” |
 
 > 顶层旧字段（`plane_normal` / `plane_d` / `plane_points` / `inlier_points` / `person_bbox_3d_m` 等）**全部保留**，与 `camera` / `world` 分组并存，向后兼容。新接入方建议直接使用分组字段。
+
+#### 姿势输出（`pose_inference=true`）
+
+姿势推理是同一 ground 进程内可选的 SAM3D Body ViT-H 能力，不新增 HTTP 服务；bbox 来自 LangSAM 人物 mask 的图像像素范围并作边界扩展。P0 每张图只推理一个合并 mask 对应的 bbox，不运行 ViTPose，也不承诺多人分离。`pose_inference=false` 时省略 `pose` 字段。
+
+| `pose` 字段 | 说明 |
+|---|---|
+| `status` | `success` / `skipped` / `error`；姿势子任务失败不会改变地面结果 |
+| `engine` | `sam3d_body_vith` |
+| `skeleton_source` | `MHR127_direct`；从 SAM3D MHR-127 joints 选取 SMPL-24 |
+| `joints_3d` | `number[24][3]`，Figure 系位置，单位米；不属于 ground camera/world 系 |
+| `joints_3d_coordinate_system` / `joints_3d_unit` | 固定为 `figure` / `m` |
+| `orientation_mode` | `fixed_camera_to_figure_v6` |
+| `bbox_2d_xyxy` | 人物 mask 派生并扩边裁剪后的图像像素坐标 `[x1,y1,x2,y2]` |
+| `camera` | SAM3D 相机估计及输入图像尺寸；`calibration` 表示模型默认 FOV，非实测标定 |
+| `time_ms` | 请求内姿势推理耗时；姿势模型不可用或 mask 无效时不一定存在 |
+| `error` | `skipped` / `error` 时的简要原因 |
+| `overlay_error` | 可选；姿势推理成功但生成 2D 姿势叠加图失败时的错误摘要；`joints_3d` 仍有效 |
+| `mesh_error` | 可选；姿势推理成功但网格生成或对应可视化绘制失败时的错误摘要；`joints_3d` 和地面结果仍有效，独立 `visualization.pose_mesh`（若已成功绘制）不受 `views` 绘制失败影响 |
+| `alignment` | 可选；`pose_want_mesh=true` 且 `visualize=true` 时返回网格配准状态。流程为**相机系地面锚定（首选，刚体、不缩放）**：用 SAM3D 网格最低分位顶点拟合其自带接触面 → 把接触面法向旋到检测到的相机系地面法向（转角上限 10°）→ 沿地面法向平移使最低分位高度归零。接触面倾角超过上限或顶点不足时回退到**加权关键点 Umeyama → 固定尺度 trimmed ICP → 接触面小角度转平**；随后两种路径统一走**地面接触垂直吸附 → 刚体精修（默认仅沿地面法向平移）**。`status=success` 时字段：`method`（`camera_ground_anchor` 或 `weighted_keypoint_umeyama+depthpro`）、`scale`（地面锚定路径恒为 1.0）、`rmse_m`（关键点内点 RMSE）、`rmse_all_m`、`rmse_before_refine_m`（ICP/接触面转平/吸附后、刚体精修前的关键点 RMSE）、`rmse_final_m`（刚体精修后的关键点 RMSE）、`keypoints_used` / `keypoints_total`、`translation_m`、`keypoint_weight`、`keypoint_diagnostics`（残差最大的至多 12 个关键点，含 `index`、`residual_m`、`weight`、`sam3d_cam`、`depth_cam`）、`camera_ground_check`（原始 SAM3D 网格相对**相机系**地面的高度诊断：`plane_normal`、`plane_d_m`、`mesh_height_m`（`min` / `p1` / `p5` / `p50` / `max`，米）、`mesh_low_plane_tilt_deg` 最低 1% 顶点拟合面相对地面的倾角）、`ground_anchor`（相机系地面锚定报告：`status` 为 `applied` / `skipped` / `error`，`method=camera_ground_anchor`、`scale`（恒 1.0）、`contact_points`、`contact_normal_cam`、`tilt_deg`、`max_tilt_deg`、`applied_tilt_deg`、`pivot_cam`、`axis_cam`、`contact_quantile`、`contact_height_before_m` / `contact_height_after_m`、`shift_m`、`shift_limit_m`（默认 0.30 m）、`lowest_before_m` / `lowest_after_m`；跳过时带 `reason`）、`icp`（`mode=translation`、`trim_ratio`、`trimmed_rmse_m`、`correspondence_mean_m`、`rotation_deg`、`translation_m`、`shift_m`、`limited`）、`contact_plane`（`angle_deg` 接触面相对世界水平面的倾角、`applied_deg` 实际施加转角上限 5°、`max_angle_deg`、`points` 参与拟合的网格低点数、`normal_world`、`pivot_world` 旋转枢轴、`limited`；接触点不足或接触面已水平时为 `skipped`）、`ground_snap`（`source`：`contact_footprint` 用检测到的身体-地面接触区域落位，`mesh_low_quantile` 为无接触点时回退到网格最低分位；`offset_m`、`clusters_with_mesh`、`clusters`（每簇 `contact_points`、`mesh_vertices`、`lowest_before_m`、`gap_after_m`）、`contact_points`、`contact_clusters`、`radius_m`、`lowest_vertex_before_m` / `lowest_vertex_after_m`、`sink_tolerance_m`，仅沿世界重力轴 1-DOF 平移，上限 30cm）、`refine`（末段刚体精修：只优化整体平移（约束到地面法向，1-DOF）/可选的微小整体旋转，姿势与尺度冻结。`status` 为 `applied` / `skipped` / `rejected` / `error`；`method`、`iterations`、`delta_rot_deg`（实际整体转角）、`delta_trans_m`（实际生效的地面法向位移，世界系）、`rotation_limit_deg`（转角上限，默认 0° 即不旋转）、`contact_target_m` / `contact_target_source`、`contact_height_before_m` / `contact_height_after_m`、`penetration_ratio_before` / `penetration_ratio_after`、`max_vertex_shift_m`（默认上限 0.15 m）、`losses`（`contact_m2` / `penetration_m2` / `chamfer_m2` / `projection_m2` / `rotation_reg` / `translation_reg` / `total`））。`status=skipped` 时带 `reason`，网格保持原始模型位置 |
+
+姿势图片不放入 `pose` 对象：请求显式启用 `pose_want_overlay` 和/或 `pose_want_mesh` 并同时设置 `visualize=true` 时，成功绘制的图片分别以独立的 `visualization.pose_overlay`、`visualization.pose_mesh` data URI 返回；原有 `visualization.overlay` 语义不变。`pose_mesh` 由 SAM3D 原始 `pred_vertices` 与模型拓扑绘制，显示模型坐标系，不承诺米制尺度。另在 `pose_want_mesh=true` 时，服务将完整网格按 `pred_vertices + pred_cam_t` 放入 `visualization.views` 的相机系面板，并在 `alignment.status=success` 时先做**相机系地面锚定**（SAM3D 网格自带接触面转平 + 沿相机系地面法向落位，尺度恒 1.0，不缩放；接触面倾角超限才回退到关键点 Umeyama——DepthPro 深度在 MHR-70 关键点像素处采样，与 SAM3D 相机系关键点配对，含离群点剔除），再经 ground 相机到世界系的旋转换算放入世界系面板及独立 `visualization.pose_world`。该配准在整体刚体变换（平移、旋转）之外，末段只对网格整体做**刚体精修**：默认仅沿地面法向平移（1-DOF，横向与纵深沿用前面各阶段的配准结果），可选的微小整体旋转由 `max_rotation_deg` 控制、默认关闭；顶点之间的相对几何、关节角度与尺度全部冻结，因此不会改写 SAM3D 预测的姿势。损失由接触/穿透/人体深度 Chamfer/2D 关键点投影/平移与旋转正则联合构成。实测整体旋转会改变角色在图中的朝向、反而恶化 2D 关键点一致性，而地面接触只需要沿重力轴平移即可达成；整体顶点位移受 `max_vertex_shift_m`（默认 0.15 m）约束，超出则整体拒绝并保留原网格，状态见 `alignment.refine`；配准失败时自动退回原始网格位置，地面结果不受影响。
+
+P0 不返回 ViTPose 2D keypoints/confidence，也不把 `joints_3d` 变换到 ground 的相机系或世界系。资源路径通过服务启动环境变量 `SAM3D_RESOURCES` 或 `--sam3d-resources` 指定到 `ImagePose_Resources` 根目录；需有 `vendor/sam-3d-body` 和 SAM3D ViT-H 权重，并使用兼容 CUDA 的运行环境。配置缺失/加载失败只会使姿势模块不可用，不影响地面服务；请求启用时 `pose.status` 为 `error` 或 `skipped`。
 
 #### 两系分组输出（`camera` / `world`）
 
@@ -209,14 +245,19 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
 
 #### 可视化输出（`visualize: true`）
 
-响应中的 `visualization` 为两个 PNG data URI（可直接用于 `<img src="...">`）：
+响应中的 `visualization` 含地面分析的 `overlay` 与 `views`；姿势骨架图和 3D 网格图可分别独立请求。设置 `pose_want_mesh=true` 时，成功绘制后还返回独立的 `pose_world` 世界视角图。只有对应开关、`pose_inference=true`、`visualize=true` 且姿势推理成功时才返回姿势图。
 
 | key | 内容 | 用途 |
 |---|---|---|
 | `overlay` | 原图叠加半透明色块：绿色 = LangSAM 分割的地面 mask，蓝色 = RANSAC 平面内点，黄色 = 人物 mask，红色 = 接触区域 | 直观检查分割/拟合是否对准地面，及人物与地面接触位置 |
-| `views` | **相机视角与世界 3D 视角左右拼合对比图**（单张 matplotlib 3D 图）：两面板都叠加场景点云、地面内点（绿）、拟合地面平面网格（相机面板橙色 / 世界面板红色）、人物点云（黄）、相机视锥（青色棱线 + 近平面，世界面板带蓝色观察方向箭头）；**左面板按相机视角渲染**：观察者位于相机位置沿光轴向前看（屏幕右 = `+x`、屏幕下 = `+y`，与真实相机图像方向一致，近点大远点小），相机在画面中心，视锥近平面即图像四角；右面板为世界坐标系（地面 `z=0`、法向量朝上、物体离地高度为正，含法向箭头） | 左侧直接对照相机图像检查分割/拟合是否对准地面及人物空间分布，右侧确认"地面平放、法向量朝上"及相机在世界系中的位置与观察角度，一张图完成对比 |
+| `views` | **相机视角与世界 3D 视角左右拼合对比图**：包含场景点云、地面与可选 SAM3D 网格。请求 `pose_want_mesh=true` 时网格也显示于两面板中；`pose.alignment.status=success` 时世界面板中的网格已配准到 DepthPro 人物点云（图例标注 `aligned`），否则保持原始模型位置；网格绘制失败记录在 `pose.mesh_error`，不影响地面输出 | 查看相机/世界整体几何 |
+| `pose_overlay` | 原始 RGB 图像叠加 SAM3D Body 的 COCO-17 人体骨架，来自模型原生 MHR-70 2D 关键点；这是独立图片，不改动 `overlay` 和 `views` | 检视 SAM3D 预测的图像平面人体姿态；不依赖 ViTPose |
+| `pose_mesh` | SAM3D Body 独立 Front/Side/Back 网格图（模型坐标，不承诺米制尺度） | 检视预测网格形状 |
+| `pose_world` | 聚焦于 SAM3D 网格/人物点云的独立世界系 3D 图：DepthPro 场景点云、人物点云、SAM3D 网格及 `z=0` 地面基准；front/side/top 三个正交视图。`pose.alignment.status=success` 时标题标注配准尺度、关键点 RMSE、trimmed ICP 残差与地面吸附位移；配准只修正整体位置/尺度，姿势误差仍在 | 直接观察世界视角下 SAM3D 网格与场景/人物点云的空间分布 |
 
-> 注意：`visualize` 会增加约 2~4s 与 ~800KB 响应体积（`views` 需渲染两个 3D 场景面板），仅在需要人工确认时开启。
+> 若姿势 3D 推理成功但 2D keypoints 无效或姿势图编码失败，不影响姿势 3D 结果；`pose.overlay_error` 会给出绘图失败摘要，`visualization.pose_overlay` 不返回。网格绘制失败同样不影响姿势关节结果，错误摘要写入 `pose.mesh_error`，且不返回 `visualization.pose_mesh`。
+
+> 注意：`visualize` 会增加约 2~4s 与 ~800KB 响应体积（`views` 需渲染两个 3D 场景面板），仅在需要人工确认时开启。姿势 overlay 和 mesh 均独立按需生成，会额外增加绘图时间和响应体积。
 
 #### 坐标系约定
 

@@ -33,6 +33,7 @@ def extract_ground(
     iterations: int = 256,
     grid_steps: int = 100,
     random_seed: int = 0,
+    min_vertical_component: float = 0.5,
 ) -> dict[str, np.ndarray | float]:
     """Fit a ground plane from a supplied metric depth map and floor mask.
 
@@ -40,6 +41,11 @@ def extract_ground(
     accepted to enforce that all image-space inputs share a common resolution.
     Segmentation and depth-model inference are deliberately injectable at the
     project boundary; this core does not load human-scene models.
+
+    ``min_vertical_component`` 是竖直面剔除阈值：相机系 y 轴向下，真实地面法向的
+    ``|n_y|`` 应接近 1；背板/墙面等竖直面的 ``|n_y|`` 接近 0。RANSAC 只接受
+    ``|n_y| >= min_vertical_component`` 的候选平面，避免分割掩码里的大面积背景墙
+    抢走最大内点数。
     """
     image_rgb = np.asarray(image_rgb)
     depth = np.asarray(depth, dtype=np.float64)
@@ -52,6 +58,8 @@ def extract_ground(
         raise ValueError("image_rgb, depth, and floor_mask must have matching HxW")
     if distance_threshold <= 0 or iterations < 1 or grid_steps < 2:
         raise ValueError("distance_threshold must be positive; iterations >= 1; grid_steps >= 2")
+    if not 0.0 <= min_vertical_component <= 1.0:
+        raise ValueError("min_vertical_component must be within [0, 1]")
 
     points = depth_to_points(depth, intrinsics)
     valid_mask = np.isfinite(points).all(axis=-1) & (depth > 0)
@@ -61,6 +69,7 @@ def extract_ground(
 
     rng = np.random.default_rng(random_seed)
     best_inliers = np.zeros(len(candidates), dtype=bool)
+    rejected_vertical = 0
     for _ in range(iterations):
         sample = candidates[rng.choice(len(candidates), size=3, replace=False)]
         normal = np.cross(sample[1] - sample[0], sample[2] - sample[0])
@@ -68,13 +77,19 @@ def extract_ground(
         if norm < 1e-10:
             continue
         normal /= norm
+        if abs(float(normal[1])) < min_vertical_component:
+            rejected_vertical += 1
+            continue
         offset = -np.dot(normal, sample[0])
         inliers = np.abs(candidates @ normal + offset) <= distance_threshold
         if inliers.sum() > best_inliers.sum():
             best_inliers = inliers
 
     if best_inliers.sum() < 3:
-        raise ValueError("could not fit a plane from the supplied floor points")
+        raise ValueError(
+            "could not fit a horizontal plane from the supplied floor points"
+            f"（{rejected_vertical}/{iterations} 个候选因接近竖直面被剔除）"
+        )
 
     plane_inlier_points = candidates[best_inliers]
     center = plane_inlier_points.mean(axis=0)
@@ -82,6 +97,14 @@ def extract_ground(
     plane_normal = vh[-1]
     plane_normal /= np.linalg.norm(plane_normal)
     plane_d = float(-np.dot(plane_normal, center))
+
+    # 精化后的平面仍需通过竖直面检查，防止内点混合把法向拉回墙面。
+    if abs(float(plane_normal[1])) < min_vertical_component:
+        raise ValueError(
+            "fitted plane is vertical"
+            f" (|n_y|={abs(float(plane_normal[1])):.2f} < {min_vertical_component:.2f})；"
+            "地面掩码可能包含墙面/背板"
+        )
 
     # Fix the sign deterministically so repeated runs have stable output.
     dominant_axis = np.argmax(np.abs(plane_normal))

@@ -6,6 +6,8 @@ VENV=/mnt/g/UGit/qwen3-vl/.venv-ground   # 独立虚拟环境（共享 torch/CUD
 # GroundingDINO 权重在 HuggingFace 缓存中；离线启动避免联网超时
 export HF_HOME="${HF_HOME:-/home/art/.cache/huggingface}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+# 启用 P0 姿势推理时，设置为 ImagePose_Resources 根目录（其中包含 models/ 与 vendor/）。
+# export SAM3D_RESOURCES="${SAM3D_RESOURCES:-/mnt/g/UGit/QingGeTools/ImagePose_Resources}"
 # =====================================================================
 
 pause_on_exit() {
