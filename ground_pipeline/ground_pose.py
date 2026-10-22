@@ -121,6 +121,32 @@ def _pose_mesh_data_uri(vertices: np.ndarray, faces: np.ndarray) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+RAW_POSE_FIELDS = (
+    "pred_joint_coords",
+    "mhr_joint_coords",
+    "pred_global_rots",
+    "mhr_joint_global_rots",
+    "pred_keypoints_3d",
+    "pred_keypoints_2d",
+    "pred_cam_t",
+    "global_rot",
+    "pred_vertices",
+    "focal_length",
+    "scale_params",
+    "shape_params",
+)
+
+
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+    return value
+
+
 def mask_to_bbox(person_mask: np.ndarray) -> np.ndarray:
     if person_mask.ndim != 2 or not person_mask.size:
         raise ValueError("Expected a non-empty 2D person mask")
@@ -185,6 +211,7 @@ class GroundPoseEstimator:
         want_overlay: bool = False,
         want_mesh: bool = False,
         cam_int: np.ndarray | None = None,
+        include_raw: bool = False,
     ) -> dict[str, Any]:
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError("Expected an RGB HxWx3 image")
@@ -200,7 +227,7 @@ class GroundPoseEstimator:
                 use_mask=False,
                 cam_int=(
                     torch.as_tensor(cam_int, dtype=torch.float32).unsqueeze(0)
-                    if want_mesh and cam_int is not None else None
+                    if cam_int is not None else None
                 ),
                 inference_type="body",
             )
@@ -233,6 +260,17 @@ class GroundPoseEstimator:
             "bbox_2d_xyxy": bbox[0].tolist(),
             "camera": camera,
         }
+        if include_raw:
+            raw: dict[str, Any] = {}
+            for key in RAW_POSE_FIELDS:
+                value = person.get(key)
+                if value is None:
+                    continue
+                try:
+                    raw[key] = _to_jsonable(value)
+                except Exception as exc:
+                    raw[f"{key}_error"] = f"{type(exc).__name__}: {exc}"
+            result["raw"] = raw
         if want_overlay:
             try:
                 keypoints_2d = np.asarray(person["pred_keypoints_2d"], dtype=np.float32)

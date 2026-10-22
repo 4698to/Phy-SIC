@@ -10,23 +10,39 @@ ground_pipeline 地面提取服务
 
 import argparse
 import base64
+import cv2
 import io
+import json
 import logging
 import os
+import threading
 import time
+import uuid
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, model_serializer
 
 import depth_pro
 from lang_sam import LangSAM
 
 from ground_pipeline import extract_ground
+from ground_pipeline.ground_retarget import (
+    GroundTransform,
+    RetargetAdapter,
+    RetargetError,
+    apply_world_frames,
+    build_world_block,
+    insert_world_xml,
+    landing_shift,
+    parse_ground_request,
+    skipped_world,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1393,6 +1409,852 @@ def _ground_views_png(depth, intrinsics, inlier_points, plane_grid, plane_normal
     return _to_data_uri(buf)
 
 
+# ---------------------------------------------------------------------------
+# 姿势推理接口（/v1|v2/pose/*）：参考 ai_vitpose.app + 本项目地面世界系
+# ---------------------------------------------------------------------------
+
+POSE_ENGINE = "sam3d_vitpose"
+POSE_API_VERSION = 3
+POSE_MAX_BODY_BYTES = 40 * 1024 * 1024
+POSE_GROUND_MODES = ("auto", "request", "infer", "none")
+POSE_MULTIPART_IMAGE_FIELDS = ("file", "image", "upload")
+POSE_ENDPOINTS = (
+    "GET /v1/pose/health",
+    "GET /v2/pose/health",
+    "GET /v1/pose/info",
+    "POST /v1/pose/single",
+    "POST /v2/pose/single",
+    "POST /v1/pose/cancel",
+    "POST /v2/pose/cancel",
+)
+
+
+class _PosePayloadTooLarge(ValueError):
+    """请求体或图片超过上限（映射 413）。"""
+
+
+def _pose_as_bool(value: Any, default: bool) -> bool:
+    """字符串/数字/布尔 -> bool；空串用默认值，非法非空值抛 ValueError。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"布尔字段取值非法: {value}（仅 true/false/1/0）")
+
+
+def _pose_xml_text(root: ET.Element, tag: str) -> Optional[str]:
+    node = root.find(tag)
+    if node is None or node.text is None:
+        return None
+    return node.text.strip()
+
+
+def _pose_ground_from_xml(root: ET.Element) -> Optional[Dict[str, Any]]:
+    """``<ground nx= ny= nz= d= />`` -> 平面请求；缺少任一属性即 400。"""
+    node = root.find("ground")
+    if node is None:
+        return None
+    values: Dict[str, float] = {}
+    for key in ("nx", "ny", "nz", "d"):
+        raw = node.get(key)
+        if raw is None or not str(raw).strip():
+            raise ValueError(f"<ground> 缺少属性 {key}")
+        try:
+            values[key] = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"<ground {key}> 不是合法数字: {raw}") from exc
+    return {"plane_normal": [values["nx"], values["ny"], values["nz"]], "plane_d": values["d"]}
+
+
+def _pose_parse_request_xml(raw: bytes) -> Dict[str, Any]:
+    """解析 v2 的 ``poseRequest`` XML（含 <ground> 与本项目扩展字段）。"""
+    try:
+        root = ET.fromstring(raw.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"XML 解析失败: {exc}") from exc
+    if root.tag != "poseRequest":
+        raise ValueError(f"根节点必须是 poseRequest，实际为 {root.tag}")
+    data: Dict[str, Any] = {}
+    for key in (
+        "image",
+        "image_path",
+        "request_id",
+        "engine",
+        "response_format",
+        "ground_mode",
+        "target_fingerprint",
+        "retarget_schema",
+    ):
+        text = _pose_xml_text(root, key)
+        if text:
+            data[key] = text
+    for key in ("want_overlay", "want_raw", "want_world", "want_mesh"):
+        text = _pose_xml_text(root, key)
+        if text is not None and text != "":
+            data[key] = text
+    ground = _pose_ground_from_xml(root)
+    if ground is not None:
+        data["ground"] = ground
+    bundle = root.find("target_tpose_bundle")
+    if bundle is not None:
+        data["target_tpose_bundle"] = {
+            "text": (bundle.text or "").strip(),
+            "schema": bundle.get("schema") or "",
+            "encoding": bundle.get("encoding") or "",
+            "fingerprint": bundle.get("fingerprint") or "",
+        }
+    return data
+
+
+def _pose_cancel_xml(payload: Dict[str, Any]) -> bytes:
+    root = ET.Element("poseCancelResult")
+    ET.SubElement(root, "request_id").text = str(payload.get("request_id") or "")
+    ET.SubElement(root, "cancelled").text = "true" if payload.get("cancelled") else "false"
+    if payload.get("error"):
+        ET.SubElement(root, "error").text = str(payload["error"])
+    tree = ET.ElementTree(root)
+    try:
+        ET.indent(tree, space="  ")
+    except AttributeError:
+        pass
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _pose_json_default(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    raise TypeError(f"无法序列化: {type(value).__name__}")
+
+
+def _pose_json_bytes(body: Dict[str, Any]) -> bytes:
+    return json.dumps(body, ensure_ascii=False, indent=2, default=_pose_json_default).encode("utf-8") + b"\n"
+
+
+def _pose_local_path(source: str) -> str:
+    """``file:///g:/x.jpg`` / ``/g:/x.jpg`` -> ``g:/x.jpg``（WSL 与 Windows 路径均可）。"""
+    text = source.strip()
+    if text.startswith("file://"):
+        text = text[7:]
+    if len(text) > 3 and text[0] == "/" and text[2] == ":":
+        text = text[1:]
+    return text
+
+
+def _pose_load_image(data: Dict[str, Any], upload: Optional[bytes] = None) -> np.ndarray:
+    """multipart 上传优先，其次 data URI / http(s) / 本地路径。"""
+    if upload:
+        if len(upload) > POSE_MAX_BODY_BYTES:
+            raise _PosePayloadTooLarge("图片超过 40 MB 上限")
+        return np.asarray(__import__("PIL").Image.open(io.BytesIO(upload)).convert("RGB"))
+    source = data.get("image_path") or data.get("image")
+    if source is None or not str(source).strip():
+        raise ValueError("缺少 image 或 image_path")
+    text = str(source).strip()
+    if not (text.startswith("data:image") or text.startswith("http://") or text.startswith("https://")):
+        text = _pose_local_path(text)
+    return _load_image(text)
+
+
+def _pose_infer_ground_transform(
+    state: Dict[str, Any], rgb: np.ndarray, *, floor_prompt: str
+) -> Optional[GroundTransform]:
+    """LangSAM + DepthPro + extract_ground -> GroundTransform；模型未就绪返回 None。"""
+    if state.get("segmenter") is None or state.get("depth") is None:
+        return None
+    image_pil = __import__("PIL").Image.fromarray(rgb)
+    segmentation = state["segmenter"].predict([image_pil], [floor_prompt])[0]
+    masks = np.asarray(segmentation["masks"], dtype=bool)
+    if masks.ndim == 2:
+        floor_mask = masks
+    elif masks.ndim == 3 and masks.shape[0] > 0:
+        floor_mask = masks.any(axis=0)
+    else:
+        raise ValueError("未检出地面区域")
+
+    model, transform, device = state["depth"], state["transform"], state["device"]
+    tensor = transform(rgb).to(device)
+    with torch.inference_mode():
+        pred = model.infer(tensor)
+    depth = pred["depth"].squeeze().detach().cpu().numpy()
+    f_px = float(pred["focallength_px"].detach().cpu().item())
+    height, width = rgb.shape[:2]
+    intrinsics = np.array(
+        [[f_px, 0, width / 2], [0, f_px, height / 2], [0, 0, 1]], dtype=np.float32
+    )
+    result = extract_ground(rgb, depth, intrinsics, floor_mask)
+    return GroundTransform.from_plane(
+        result["plane_normal"],
+        float(result["plane_d"]),
+        source="inferred",
+        rotate=rotate_to_up,
+    )
+
+
+def _pose_target_fields(target: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """适配层 target -> 参考序列化器需要的四个字段。"""
+    target = target or {}
+    diagnostics = dict(target.get("target_diagnostics") or {})
+    skipped_reason = str(target.get("skipped_reason") or "")
+    if skipped_reason:
+        diagnostics.setdefault("skipped_reason", skipped_reason)
+    return {
+        "target_status": str(target.get("target_status") or "not_provided"),
+        "target_fingerprint": str(target.get("target_fingerprint") or ""),
+        "retarget_schema": str(target.get("schema") or ""),
+        "target_diagnostics": diagnostics,
+    }
+
+
+def _pose_error_body(
+    message: str,
+    *,
+    request_id: str = "",
+    target: Optional[Dict[str, Any]] = None,
+    target_status: str = "",
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {"status": "error", "engine": POSE_ENGINE, "error": str(message)}
+    if request_id:
+        body["request_id"] = request_id
+    if target is not None:
+        body.update(_pose_target_fields(target))
+    if target_status:
+        body["target_status"] = target_status
+    return body
+
+
+def _pose_cancelled_body(request_id: str) -> Dict[str, Any]:
+    return {
+        "status": "cancelled",
+        "engine": POSE_ENGINE,
+        "request_id": request_id,
+        "error": "任务已取消",
+    }
+
+
+def _pose_response_serializer(state: Dict[str, Any]) -> Optional[Any]:
+    """优先复用适配层已导入的 response_serialize 模块。"""
+    adapter = state.get("retarget")
+    if adapter is not None:
+        module = adapter.core.get("response_serialize")
+        if module is not None:
+            return module
+    try:
+        from ai_vitpose.core import response_serialize
+
+        return response_serialize
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pose_health(state: Dict[str, Any]) -> Dict[str, Any]:
+    adapter = state.get("retarget")
+    engine_ready = state.get("pose_estimator") is not None
+    adapter_health = adapter.health() if adapter is not None else {"ready": False, "error": "适配层未加载"}
+    ground_ready = state.get("segmenter") is not None and state.get("depth") is not None
+    disabled_reason = ""
+    if not engine_ready:
+        disabled_reason = str(state.get("pose_error") or "SAM3D 未配置或加载失败")
+    elif not adapter_health.get("ready"):
+        disabled_reason = str(adapter_health.get("error") or "重定向资产不可用")
+    cuda_ready = torch.cuda.is_available()
+    gpu = "cpu"
+    if cuda_ready:
+        try:
+            gpu = torch.cuda.get_device_name(0)
+        except Exception:  # noqa: BLE001
+            gpu = "cuda"
+    return {
+        # 参考实现用 healthy/disabled，Max 客户端按此判断（兼容 ok 但不再输出）
+        "status": "healthy" if engine_ready and adapter_health.get("ready") else "disabled",
+        "engine": POSE_ENGINE,
+        "api_version": POSE_API_VERSION,
+        "gpu": gpu,
+        "cuda": cuda_ready,
+        "models": {
+            "sam3d": "sam-3d-body-vith" if engine_ready else "unavailable",
+            # 本服务未接 ViT-Pose，保留字段以兼容参考 XML 结构
+            "vitpose": "disabled",
+        },
+        "world": {
+            "ready": bool(ground_ready),
+            "segmenter": state.get("segmenter") is not None,
+            "depth": state.get("depth") is not None,
+        },
+        "retarget": adapter_health,
+        "endpoints": list(POSE_ENDPOINTS),
+        "disabled_reason": disabled_reason,
+        "skeleton_source": "MHR127_direct",
+    }
+
+
+def _pose_ground_grid_bgr(
+    bgr: np.ndarray,
+    world: Optional[Dict[str, Any]],
+    camera: Optional[Dict[str, Any]],
+) -> np.ndarray:
+    """在 BGR 图上叠加检测到的地平面网格（取相机视野内、与地面世界轴对齐）。"""
+    if not isinstance(world, dict) or world.get("status") != "ok":
+        return bgr
+    normal = world.get("plane_normal_camera")
+    plane_d = world.get("plane_d_camera")
+    if normal is None or plane_d is None:
+        return bgr
+    n = np.asarray(normal, dtype=np.float64).reshape(-1)[:3]
+    if n.size != 3 or not np.isfinite(n).all():
+        return bgr
+    norm = float(np.linalg.norm(n))
+    d = float(plane_d)
+    if norm < 1e-6 or not np.isfinite(d):
+        return bgr
+    n = n / norm
+    d = d / norm
+
+    fx = float((camera or {}).get("focal_px") or 0.0)
+    height, width = bgr.shape[:2]
+    if not np.isfinite(fx) or fx <= 1.0:
+        return bgr
+    cx, cy = width / 2.0, height / 2.0
+    p0 = -d * n  # 平面上距相机最近的点
+
+    # 图像内均匀采样射线与地面求交，得到网格在平面上的可见范围
+    max_t = max(6.0, abs(d) * 4.0)
+    hits = []
+    for py in np.linspace(0.0, height - 1.0, 7):
+        for px in np.linspace(0.0, width - 1.0, 9):
+            ray = np.array([(px - cx) / fx, (py - cy) / fx, 1.0])
+            denom = float(n @ ray)
+            if abs(denom) < 1e-9:
+                continue
+            t = -d / denom
+            if 1e-3 < t <= max_t:
+                hits.append(t * ray)
+    if len(hits) < 4:
+        return bgr
+
+    rot: Optional[np.ndarray] = None
+    if world.get("rotation") is not None:
+        candidate = np.asarray(world["rotation"], dtype=np.float64)
+        if candidate.shape == (3, 3) and np.isfinite(candidate).all():
+            rot = candidate
+    u: Optional[np.ndarray] = None
+    if rot is not None:
+        in_plane = rot[0] - float(rot[0] @ n) * n
+        if np.linalg.norm(in_plane) > 1e-6:
+            u = in_plane / np.linalg.norm(in_plane)
+    if u is None:
+        ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        u = np.cross(n, ref)
+        u = u / np.linalg.norm(u)
+    v = np.cross(n, u)
+    v = v / np.linalg.norm(v)
+
+    rel = np.asarray(hits) - p0
+    a = rel @ u
+    b = rel @ v
+    a0, a1 = float(a.min()), float(a.max())
+    b0, b1 = float(b.min()), float(b.max())
+    span = max(a1 - a0, b1 - b0)
+    if not np.isfinite(span) or span <= 0.05:
+        return bgr
+    step = max(0.25, round(span / 12.0, 2))
+
+    # 以地面世界原点为基准对齐网格线，便于和 world 坐标对照
+    ref_a = ref_b = 0.0
+    translation = world.get("translation")
+    if rot is not None and translation is not None:
+        trans = np.asarray(translation, dtype=np.float64).reshape(-1)[:3]
+        if trans.size == 3 and np.isfinite(trans).all():
+            origin_cam = -rot.T @ trans
+            ref_a = float((origin_cam - p0) @ u)
+            ref_b = float((origin_cam - p0) @ v)
+
+    def positions(lo: float, hi: float, ref: float) -> List[float]:
+        values = []
+        value = np.floor((lo - ref) / step) * step + ref
+        while value <= hi + 1e-9 and len(values) < 256:
+            if value >= lo - 1e-9:
+                values.append(float(value))
+            value += step
+        return values
+
+    def project(point: np.ndarray) -> Optional[Tuple[int, int]]:
+        x, y, z = float(point[0]), float(point[1]), float(point[2])
+        if z <= 1e-3:
+            return None
+        return int(round(fx * x / z + cx)), int(round(fx * y / z + cy))
+
+    canvas = bgr.copy()
+    color = (0, 140, 255)
+    for av in positions(a0, a1, ref_a):
+        pa = project(p0 + av * u + b0 * v)
+        pb = project(p0 + av * u + b1 * v)
+        if pa is not None and pb is not None:
+            cv2.line(canvas, pa, pb, color, 1, cv2.LINE_AA)
+    for bv in positions(b0, b1, ref_b):
+        pa = project(p0 + a0 * u + bv * v)
+        pb = project(p0 + a1 * u + bv * v)
+        if pa is not None and pb is not None:
+            cv2.line(canvas, pa, pb, color, 1, cv2.LINE_AA)
+    return cv2.addWeighted(canvas, 0.55, bgr, 0.45, 0.0)
+
+
+def _pose_overlay_b64(
+    adapter: RetargetAdapter,
+    rgb: np.ndarray,
+    keypoints: Any,
+    *,
+    world: Optional[Dict[str, Any]] = None,
+    camera: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    module = adapter.core.get("overlay")
+    if module is None:
+        return None
+    kp = np.asarray(keypoints if keypoints is not None else [], dtype=np.float32)
+    if kp.ndim != 2 or kp.shape[0] < 17 or kp.shape[1] < 3:
+        return None
+    bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+    bgr = _pose_ground_grid_bgr(bgr, world, camera)
+    return module.draw_overlay_jpeg_b64(bgr, kp)
+
+
+def _pose_resolve_ground(
+    state: Dict[str, Any],
+    *,
+    data: Dict[str, Any],
+    ground_mode: str,
+    rgb: np.ndarray,
+    default_floor_prompt: str,
+) -> Tuple[Optional[GroundTransform], str, Optional[str]]:
+    """按 ground_mode 解析地平面，返回 ``(transform, status, error)``。"""
+    if ground_mode == "none":
+        return None, "skipped", "ground_mode=none"
+    ground = data.get("ground")
+    if ground is not None:
+        return parse_ground_request(ground, rotate=rotate_to_up), "ok", None
+    prompts = data.get("ground_infer_prompts")
+    prompts = prompts if isinstance(prompts, dict) else {}
+    floor_prompt = str(prompts.get("floor_prompt") or default_floor_prompt)
+    try:
+        transform = _pose_infer_ground_transform(state, rgb, floor_prompt=floor_prompt)
+    except ValueError as exc:
+        status = "error" if ground_mode == "infer" else "skipped"
+        return None, status, str(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("姿势接口地面推理失败")
+        status = "error" if ground_mode == "infer" else "skipped"
+        return None, status, f"{type(exc).__name__}: {exc}"
+    if transform is None:
+        if ground_mode == "infer":
+            raise RetargetError("DepthPro/LangSAM 未就绪，无法推理地面", status_code=503, stage="world")
+        return None, "skipped", "地面推理未就绪"
+    return transform, "ok", None
+
+
+# 落地平移作用于 SAM-3D 的模型系坐标（相对量 + pred_cam_t）
+_POSE_RAW_POSITION_FIELDS = ("pred_joint_coords", "mhr_joint_coords", "pred_keypoints_3d", "pred_vertices")
+
+
+def _pose_apply_landing(transform: GroundTransform, raw: Dict[str, Any]) -> Dict[str, Any]:
+    """把 SAM-3D 源数据整体沿世界 +Z 平移到地面，返回落地报告。
+
+    在 ``assemble_pose`` 之前调用：关节、关键点、网格、重定向、generic_pose 与世界系
+    全部由落地后的 SAM-3D 结果派生，因此下游各字段天然同一高度。
+    """
+    snap = landing_shift(
+        transform,
+        mesh_vertices=raw.get("pred_vertices"),
+        joint_coords=raw.get("mhr_joint_coords")
+        if raw.get("mhr_joint_coords") is not None
+        else raw.get("pred_joint_coords"),
+        keypoints_3d=raw.get("pred_keypoints_3d"),
+        pred_cam_t=raw.get("pred_cam_t"),
+    )
+    shift = np.asarray(snap.pop("shift_cam"), dtype=np.float64).reshape(3)
+    if snap.get("status") == "applied":
+        for key in _POSE_RAW_POSITION_FIELDS:
+            value = raw.get(key)
+            if value is None:
+                continue
+            arr = np.asarray(value, dtype=np.float64)
+            if arr.ndim != 2 or arr.shape[-1] < 3:
+                continue
+            moved = arr.copy()
+            moved[:, :3] += shift
+            raw[key] = moved.tolist()
+    return snap
+
+
+def _pose_resolve_world(
+    state: Dict[str, Any],
+    *,
+    transform: GroundTransform,
+    ground_mode: str,
+    internal: Dict[str, Any],
+    body: Dict[str, Any],
+    want_mesh: bool,
+    raw: Dict[str, Any],
+    ground_snap: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """把（已落地的）Figure 结果换算到 ground_world_v1 世界系。"""
+    # 网格顶点始终解析：即使不返回 world.mesh，也用其参与世界系构造
+    mesh_vertices = None
+    mesh_faces = None
+    estimator = state.get("pose_estimator")
+    vertices = raw.get("pred_vertices")
+    faces = getattr(getattr(estimator, "estimator", None), "faces", None)
+    if vertices is not None:
+        mesh_vertices = np.asarray(vertices, dtype=np.float64)
+        if faces is not None:
+            mesh_faces = np.asarray(faces, dtype=np.int64)
+
+    return build_world_block(
+        transform,
+        ground_mode=ground_mode,
+        joints_fig=internal["joints_fig"],
+        keypoints_3d_cam=internal["keypoints_3d_cam"],
+        pred_cam_t=internal["pred_cam_t"],
+        generic_pose=internal.get("generic"),
+        retarget_payload=body.get("retarget"),
+        bip22_joints=internal.get("bip22_joints"),
+        bip22_anchor=internal.get("bip22_anchor"),
+        mesh_vertices=mesh_vertices,
+        mesh_faces=mesh_faces,
+        include_mesh=want_mesh,
+        ground_snap=ground_snap,
+    )
+
+
+def _pose_camera_space_block(
+    state: Dict[str, Any], raw: Dict[str, Any], keypoints_3d_coco17: Any
+) -> Optional[Dict[str, Any]]:
+    """无可靠地面时的回退：只输出相机锚定（camera_v1）的 SAM-3D 数据。
+
+    顶点与关键点都在 SAM-3D 模型系，统一加 ``pred_cam_t`` 换到相机系
+    （与 ``build_world_block`` 里 ``+cam_t`` 的处理一致）。
+    全程不做地面平面换基、不做落地平移。
+    """
+    vertices = raw.get("pred_vertices")
+    cam_t = raw.get("pred_cam_t")
+    if vertices is None or cam_t is None:
+        return None
+    verts = np.asarray(vertices, dtype=np.float64)
+    if verts.ndim != 2 or verts.shape[1] != 3 or not np.isfinite(verts).all():
+        return None
+    cam_t_arr = np.asarray(cam_t, dtype=np.float64).reshape(3)
+    kp = (
+        np.asarray(keypoints_3d_coco17, dtype=np.float64).reshape(-1, 3) + cam_t_arr.reshape(1, 3)
+        if keypoints_3d_coco17 is not None
+        else np.zeros((0, 3))
+    )
+    faces = getattr(getattr(state.get("pose_estimator"), "estimator", None), "faces", None)
+    return {
+        "frame": "camera_v1",
+        "unit": "meter",
+        "convention": "x right, y down, z forward",
+        "note": "camera-anchored SAM-3D mesh/keypoints (model coords + pred_cam_t); no ground transform",
+        "pred_cam_t": cam_t_arr.tolist(),
+        "vertices": (verts + cam_t_arr.reshape(1, 3)).tolist(),
+        "faces": np.asarray(faces, dtype=np.int64).tolist() if faces is not None else [],
+        "keypoints_3d_coco17": kp.tolist(),
+    }
+
+
+async def _pose_read_request(request: Request, content_type: str) -> Tuple[Dict[str, Any], Optional[bytes]]:
+    """multipart / XML / JSON 三种请求体 -> (字段 dict, 上传图片字节)。"""
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        data: Dict[str, Any] = {}
+        upload: Optional[bytes] = None
+        for key, value in form.multi_items():
+            filename = getattr(value, "filename", None)
+            if filename:
+                payload = await value.read()
+                if upload is None or key in POSE_MULTIPART_IMAGE_FIELDS:
+                    upload = payload
+                continue
+            text = str(value)
+            if key == "ground":
+                try:
+                    data["ground"] = json.loads(text)
+                except Exception as exc:  # noqa: BLE001
+                    raise ValueError(f"ground 必须是 JSON 对象: {exc}") from exc
+            else:
+                data[key] = text
+        parts = {key: data.get(key) for key in ("ground_nx", "ground_ny", "ground_nz", "ground_d")}
+        if all(value is not None for value in parts.values()):
+            try:
+                data["ground"] = {
+                    "plane_normal": [
+                        float(parts["ground_nx"]),
+                        float(parts["ground_ny"]),
+                        float(parts["ground_nz"]),
+                    ],
+                    "plane_d": float(parts["ground_d"]),
+                }
+            except ValueError as exc:
+                raise ValueError(f"ground_nx/ny/nz/d 必须是数字: {exc}") from exc
+        for key in ("ground_nx", "ground_ny", "ground_nz", "ground_d"):
+            data.pop(key, None)
+        return data, upload
+
+    raw = await request.body()
+    if len(raw) > POSE_MAX_BODY_BYTES:
+        raise _PosePayloadTooLarge("请求体超过 40 MB 上限")
+    if not raw.strip():
+        raise ValueError("请求体为空")
+    if raw.lstrip().startswith(b"<"):
+        return _pose_parse_request_xml(raw), None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"JSON 解析失败: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+    return payload, None
+
+
+def _pose_single_pipeline(
+    state: Dict[str, Any],
+    data: Dict[str, Any],
+    *,
+    upload: Optional[bytes] = None,
+) -> Tuple[int, Dict[str, Any]]:
+    """同步执行一次姿势推理，返回 (HTTP 状态码, 响应 body)。"""
+    started = time.perf_counter()
+    request_id = str(data.get("request_id") or "").strip()
+    engine = str(data.get("engine") or "").strip()
+    if engine and engine != POSE_ENGINE:
+        # 参考实现：engine 非法属于业务失败，HTTP 200 + status=error
+        return 200, _pose_error_body(
+            f"不支持的 engine: {engine}（仅 {POSE_ENGINE}）", request_id=request_id
+        )
+    try:
+        want_overlay = _pose_as_bool(data.get("want_overlay"), True)
+        want_raw = _pose_as_bool(data.get("want_raw"), False)
+        want_world = _pose_as_bool(data.get("want_world"), True)
+        want_mesh = _pose_as_bool(data.get("want_mesh"), False)
+    except ValueError as exc:
+        return 400, _pose_error_body(str(exc), request_id=request_id)
+
+    ground_mode = str(data.get("ground_mode") or "auto").strip().lower() or "auto"
+    if ground_mode not in POSE_GROUND_MODES:
+        return 400, _pose_error_body(
+            f"不支持的 ground_mode: {ground_mode}（仅 {'/'.join(POSE_GROUND_MODES)}）",
+            request_id=request_id,
+        )
+    if ground_mode == "request" and not isinstance(data.get("ground"), dict):
+        return 400, _pose_error_body(
+            "world: ground_mode=request 但未提供 ground", request_id=request_id
+        )
+
+    estimator = state.get("pose_estimator")
+    if estimator is None:
+        return 503, _pose_error_body(
+            f"engine: {state.get('pose_error') or 'SAM3D 未配置或加载失败'}", request_id=request_id
+        )
+    adapter = state.get("retarget")
+    if adapter is None or not adapter.ready:
+        detail = str(getattr(adapter, "error", "") or "重定向资产不可用")
+        return 503, _pose_error_body(f"retarget_assets: {detail}", request_id=request_id)
+
+    try:
+        rgb = _pose_load_image(data, upload)
+    except _PosePayloadTooLarge as exc:
+        return 413, _pose_error_body(str(exc), request_id=request_id)
+    except Exception as exc:  # noqa: BLE001
+        return 400, _pose_error_body(f"image: {type(exc).__name__}: {exc}", request_id=request_id)
+
+    requested_schema = str(data.get("retarget_schema") or "auto").strip().lower() or "auto"
+    if requested_schema == "v1":
+        target: Dict[str, Any] = {
+            "profile": None,
+            "schema": "v1",
+            "target_status": "skipped",
+            "target_fingerprint": "",
+            "target_diagnostics": {"skipped_reason": "v1_baseline"},
+            "skipped_reason": "v1_baseline",
+        }
+    else:
+        try:
+            target = adapter.resolve_target(data)
+        except RetargetError as exc:
+            return exc.status_code, _pose_error_body(
+                f"{exc.stage}: {exc}",
+                request_id=request_id,
+                target_status=exc.target_status or "rejected",
+            )
+
+    lock: threading.Lock = state["pose_lock"]
+    if not lock.acquire(blocking=False):
+        return 503, _pose_error_body("GPU 忙，请稍后重试", request_id=request_id, target=target)
+
+    rid = request_id or uuid.uuid4().hex
+    cancel = threading.Event()
+    state["pose_tasks"][rid] = cancel
+    try:
+        image_pil = __import__("PIL").Image.fromarray(rgb)
+        person_mask = None
+        try:
+            person_mask = _person_mask(state["segmenter"], image_pil, state.get("person_prompt") or "")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("人物分割失败，改用整图 bbox: %s", exc)
+        if person_mask is None or not np.asarray(person_mask).any():
+            person_mask = np.ones(rgb.shape[:2], dtype=bool)
+
+        try:
+            pose = estimator.infer(
+                rgb,
+                person_mask,
+                want_overlay=False,
+                want_mesh=False,
+                cam_int=None,
+                include_raw=True,
+            )
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return 503, _pose_error_body("engine: CUDA 显存不足，请稍后重试", request_id=rid, target=target)
+        except RuntimeError as exc:
+            if "did not return" in str(exc):
+                # 参考实现：未检出人物属于业务失败，HTTP 200 + status=error
+                return 200, _pose_error_body(f"detect: 未检出人物（{exc}）", request_id=rid, target=target)
+            logger.exception("SAM3D 姿势推理失败")
+            return 500, _pose_error_body(f"engine: {type(exc).__name__}: {exc}", request_id=rid, target=target)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("SAM3D 姿势推理失败")
+            return 500, _pose_error_body(f"engine: {type(exc).__name__}: {exc}", request_id=rid, target=target)
+
+        if cancel.is_set():
+            return 200, _pose_cancelled_body(rid)
+
+        raw = pose.get("raw") or {}
+        # 落地：直接平移 SAM-3D 源数据，保证下游派生姿势与世界系可视化同高
+        ground_transform: Optional[GroundTransform] = None
+        ground_status = "skipped"
+        ground_error: Optional[str] = None
+        landing: Optional[Dict[str, Any]] = None
+        if want_world:
+            try:
+                ground_transform, ground_status, ground_error = _pose_resolve_ground(
+                    state,
+                    data=data,
+                    ground_mode=ground_mode,
+                    rgb=rgb,
+                    default_floor_prompt=state.get("floor_prompt") or DEFAULT_FLOOR_PROMPT,
+                )
+            except RetargetError as exc:
+                return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+            if ground_transform is not None:
+                landing = _pose_apply_landing(ground_transform, raw)
+
+        try:
+            body, internal = adapter.assemble_pose(
+                raw,
+                pose.get("camera") or {},
+                want_raw=want_raw,
+                require_generic=target.get("schema") != "v1",
+                bbox=pose.get("bbox_2d_xyxy"),
+            )
+        except RetargetError as exc:
+            return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+
+        # 目标骨架重定向（figure_v6 系）
+        retarget_status = "skipped"
+        if target.get("schema") not in (None, "", "v1"):
+            try:
+                result = adapter.retarget(internal.get("generic") or {}, target)
+            except RetargetError as exc:
+                return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+            if result:
+                body["retarget"] = result["payload"]
+                body["retarget_schema"] = result["schema"]
+                body["retarget_diagnostics"] = result.get("diagnostics") or {}
+                retarget_status = "ok"
+        body["retarget_status"] = retarget_status
+
+        profile = target.get("profile") if isinstance(target.get("profile"), dict) else {}
+        profile_rest = profile.get("target_tpose_bundle_rest_profile") or profile.get("biped_rest_profile")
+        if isinstance(profile_rest, dict) and profile_rest:
+            body["profile_rest"] = profile_rest
+            body["profile_rest_scope"] = "mapped"
+
+        world = None
+        if want_world:
+            if cancel.is_set():
+                return 200, _pose_cancelled_body(rid)
+            if ground_transform is not None:
+                try:
+                    world = _pose_resolve_world(
+                        state,
+                        transform=ground_transform,
+                        ground_mode=ground_mode,
+                        internal=internal,
+                        body=body,
+                        want_mesh=want_mesh,
+                        raw=raw,
+                        ground_snap=landing,
+                    )
+                except RetargetError as exc:
+                    return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+            else:
+                world = skipped_world(ground_status, ground_mode=ground_mode, error=ground_error)
+            body["world"] = world
+            # 返回给客户端的骨骼字段统一改为 ground_world_v1（world 不可用时保持 figure 原值）
+            if world.get("status") == "ok":
+                apply_world_frames(body, world, ground_transform, internal.get("pred_cam_t"))
+
+        # 无可靠世界系（want_world=false 或地面推理失败）时，额外给出相机锚定回退块
+        if want_mesh and (world is None or world.get("status") != "ok"):
+            cam_block = _pose_camera_space_block(state, raw, body.get("keypoints_3d_coco17"))
+            if cam_block is not None:
+                body["camera_space"] = cam_block
+
+        if want_overlay:
+            overlay = _pose_overlay_b64(
+                adapter,
+                rgb,
+                body.get("keypoints_2d_coco17"),
+                world=world,
+                camera=body.get("camera"),
+            )
+            if overlay:
+                body["overlay_jpeg_b64"] = overlay
+            else:
+                body["overlay_error"] = "overlay 生成失败"
+
+        body["request_id"] = rid
+        body["time_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+        body.update(_pose_target_fields(target))
+
+        diagnostics = body.get("retarget_diagnostics") or {}
+        logger.info(
+            "pose request_id=%s target_status=%s fingerprint=%s schema=%s mapped=%s det_ok=%s "
+            "unconverged=%s world.source=%s world.status=%s time_ms=%s",
+            rid,
+            body.get("target_status"),
+            body.get("target_fingerprint"),
+            body.get("retarget_schema"),
+            diagnostics.get("mapped_count"),
+            diagnostics.get("det_ok"),
+            diagnostics.get("unconverged_chains"),
+            (world or {}).get("source"),
+            (world or {}).get("status"),
+            body.get("time_ms"),
+        )
+        return 200, body
+    finally:
+        state["pose_tasks"].pop(rid, None)
+        lock.release()
+
+
 def create_ground_app(
     *,
     device: str = "auto",
@@ -1402,7 +2264,19 @@ def create_ground_app(
     person_prompt: str = "person.",
     sam3d_resources: Optional[str | Path] = None,
 ) -> FastAPI:
-    state: Dict[str, Any] = {"segmenter": None, "depth": None, "transform": None, "device": torch.device("cpu"), "pose_estimator": None}
+    state: Dict[str, Any] = {
+        "segmenter": None,
+        "depth": None,
+        "transform": None,
+        "device": torch.device("cpu"),
+        "pose_estimator": None,
+        "pose_error": "",
+        "retarget": None,
+        "pose_lock": threading.Lock(),
+        "pose_tasks": {},
+        "floor_prompt": floor_prompt,
+        "person_prompt": person_prompt,
+    }
     sam3d_resources = sam3d_resources or os.environ.get("SAM3D_RESOURCES")
     state["sam3d_resources"] = sam3d_resources
 
@@ -1427,8 +2301,26 @@ def create_ground_app(
 
                 state["pose_estimator"] = GroundPoseEstimator(state["sam3d_resources"])
                 logger.info("SAM3D Body 姿势模块加载完成")
-            except Exception:
+            except Exception as exc:
+                state["pose_error"] = f"{type(exc).__name__}: {exc}"
                 logger.exception("SAM3D Body 加载失败；地面服务继续运行，姿势功能不可用")
+            # 适配层独立于引擎：资产缺失只影响 /v1|v2/pose/*
+            try:
+                adapter = RetargetAdapter(state["sam3d_resources"])
+                state["retarget"] = adapter
+                if adapter.ready:
+                    summary = adapter.health().get("default_target") or {}
+                    logger.info(
+                        "姿势重定向适配层就绪 skeleton_id=%s bones=%s fingerprint=%s",
+                        summary.get("skeleton_id"),
+                        summary.get("bone_count"),
+                        summary.get("fingerprint"),
+                    )
+                else:
+                    logger.error("姿势重定向资产不可用: %s", adapter.error)
+            except Exception:
+                state["retarget"] = None
+                logger.exception("姿势重定向适配层加载失败；/v1|v2/pose/* 返回 503")
         else:
             logger.info("未配置 SAM3D_RESOURCES，姿势模块保持禁用")
         logger.info("服务就绪")
@@ -1447,6 +2339,31 @@ def create_ground_app(
         return {
             "ok": state["segmenter"] is not None and state["depth"] is not None,
             "device": str(state["device"]),
+        }
+
+    @app.get("/")
+    async def service_info():
+        """只读服务说明（参考 ImagePose_Resources 的 ``GET /`` 信息页）。"""
+        return {
+            "name": "SAM3D 姿势推理 + 地面世界系服务",
+            "engine": POSE_ENGINE,
+            "api_version": POSE_API_VERSION,
+            "endpoints": list(POSE_ENDPOINTS),
+            "image_input": [
+                "poseRequest.image_path: 服务端本地路径",
+                "poseRequest.image: data URI / 本地路径 / http(s)",
+                "multipart: file|image|upload",
+            ],
+            "v2": {
+                "health": "GET /v2/pose/health → poseHealth XML",
+                "single": "POST /v2/pose/single (application/xml poseRequest) → poseResponse XML",
+                "cancel": "POST /v2/pose/cancel → poseCancelResult XML",
+                "note": "v1 JSON 与 /health 为待移除兼容路径，新客户端只用 v2 XML",
+            },
+            "world": {
+                "request": ["want_world", "ground_mode", "ground", "want_mesh"],
+                "note": "want_world=true 时响应含 world / worldPose（ground_world_v1）",
+            },
         }
 
     @app.post("/v1/ground", response_model=GroundResult)
@@ -1880,6 +2797,133 @@ def create_ground_app(
                 "contact": world_contact,
             },
         )
+
+    # ------------------------------------------------------------------
+    # /v1|v2/pose/*：SAM3D 姿势 + biped 重定向 + 地面世界系
+    # ------------------------------------------------------------------
+    async def _pose_single(request: Request, v2: bool) -> Response:
+        from starlette.concurrency import run_in_threadpool
+
+        content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        try:
+            data, upload = await _pose_read_request(request, content_type)
+        except _PosePayloadTooLarge as exc:
+            return Response(
+                _pose_json_bytes(_pose_error_body(str(exc))),
+                status_code=413,
+                media_type="application/json; charset=utf-8",
+            )
+        except ValueError as exc:
+            return Response(
+                _pose_json_bytes(_pose_error_body(f"parse: {exc}")),
+                status_code=400,
+                media_type="application/json; charset=utf-8",
+            )
+
+        serializer = _pose_response_serializer(state)
+        fmt = "json"
+        if v2 and serializer is not None:
+            try:
+                fmt = serializer.resolve_response_format(
+                    data.get("response_format"), request.headers.get("accept"), default="xml"
+                )
+            except ValueError as exc:
+                return Response(
+                    _pose_json_bytes(_pose_error_body(str(exc))),
+                    status_code=400,
+                    media_type="application/json; charset=utf-8",
+                )
+
+        def emit(code: int, body: Dict[str, Any]) -> Response:
+            if v2 and serializer is not None:
+                content, media = serializer.serialize_v2_response(body, response_format=fmt)
+                if fmt == "xml" and isinstance(body.get("world"), dict):
+                    content = insert_world_xml(content.decode("utf-8"), body["world"]).encode("utf-8")
+                    media = "application/xml; charset=utf-8"
+                return Response(content, status_code=code, media_type=media)
+            return Response(
+                _pose_json_bytes(body),
+                status_code=code,
+                media_type="application/json; charset=utf-8",
+            )
+
+        code, body = await run_in_threadpool(_pose_single_pipeline, state, data, upload=upload)
+        return emit(code, body)
+
+    async def _pose_cancel(request: Request, v2: bool) -> Response:
+        content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        try:
+            raw = await request.body()
+            if raw.lstrip().startswith(b"<"):
+                root = ET.fromstring(raw.decode("utf-8"))
+                if root.tag != "poseCancel":
+                    raise ValueError(f"根节点必须是 poseCancel，实际为 {root.tag}")
+                payload: Dict[str, Any] = {"request_id": _pose_xml_text(root, "request_id") or ""}
+            else:
+                payload = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+        except Exception as exc:  # noqa: BLE001
+            body = {"request_id": "", "cancelled": False, "error": f"parse: {exc}"}
+            if v2 and "json" not in content_type:
+                return Response(
+                    _pose_cancel_xml(body), status_code=400, media_type="application/xml; charset=utf-8"
+                )
+            return Response(
+                _pose_json_bytes(body), status_code=400, media_type="application/json; charset=utf-8"
+            )
+
+        rid = str(payload.get("request_id") or "").strip()
+        event = state["pose_tasks"].get(rid) if rid else None
+        if event is None:
+            body = {"request_id": rid, "cancelled": False, "error": "未找到任务"}
+            if v2 and "json" not in content_type:
+                return Response(
+                    _pose_cancel_xml(body), status_code=404, media_type="application/xml; charset=utf-8"
+                )
+            return Response(
+                _pose_json_bytes(body), status_code=404, media_type="application/json; charset=utf-8"
+            )
+        event.set()
+        body = {"request_id": rid, "cancelled": True}
+        if v2 and "json" not in content_type:
+            return Response(
+                _pose_cancel_xml(body), status_code=200, media_type="application/xml; charset=utf-8"
+            )
+        return Response(
+            _pose_json_bytes(body), status_code=200, media_type="application/json; charset=utf-8"
+        )
+
+    @app.get("/v1/pose/health")
+    async def pose_health_v1():
+        return _pose_health(state)
+
+    @app.get("/v2/pose/health")
+    async def pose_health_v2():
+        health = _pose_health(state)
+        serializer = _pose_response_serializer(state)
+        if serializer is not None:
+            content, media = serializer.health_to_xml_bytes(health)
+            return Response(content, media_type=media)
+        return health
+
+    @app.get("/v1/pose/info")
+    async def pose_info():
+        return _pose_health(state)
+
+    @app.post("/v1/pose/single")
+    async def pose_single_v1(request: Request):
+        return await _pose_single(request, False)
+
+    @app.post("/v2/pose/single")
+    async def pose_single_v2(request: Request):
+        return await _pose_single(request, True)
+
+    @app.post("/v1/pose/cancel")
+    async def pose_cancel_v1(request: Request):
+        return await _pose_cancel(request, False)
+
+    @app.post("/v2/pose/cancel")
+    async def pose_cancel_v2(request: Request):
+        return await _pose_cancel(request, True)
 
     return app
 

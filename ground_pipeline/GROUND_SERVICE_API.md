@@ -287,6 +287,213 @@ P0 不返回 ViTPose 2D keypoints/confidence，也不把 `joints_3d` 变换到 g
 }
 ```
 
+### 3.3 姿势推理 `POST /v1|v2/pose/single`
+
+姿势推理**复用同一个 ground 进程**，不与地面接口抢端口：配置 `SAM3D_RESOURCES`（或 `--sam3d-resources`）后，`lifespan` 会在加载 DepthPro/LangSAM 之后额外加载 SAM3D Body ViT-H 与重定向资产（默认端口 8001；本机联调常用 8004）。未配置时地面接口照常工作，只有姿势路由返回 503。
+
+能力对齐 `G:\UGit\QingGeTools\ImagePose_Resources`（SAM3D MHR-127 → SMPL-24 → `generic_pose` → 目标骨架重定向 → CS 载荷），并新增本项目的地面世界系换算 `world`（`ground_world_v1`，+Z 向上、地面 `z=0`）。
+
+| 路由 | 内容 |
+|---|---|
+| `GET /v1/pose/health` | 就绪状态（JSON） |
+| `GET /v2/pose/health` | 就绪状态（XML `poseHealth`，Max 客户端握手用） |
+| `GET /v1/pose/info` | 与 `/v1/pose/health` 相同，便于旧客户端探测 |
+| `GET /` | 只读服务说明（endpoints / 输入方式 / 世界系开关） |
+| `POST /v1/pose/single` | 单张图片推理，响应恒为 JSON |
+| `POST /v2/pose/single` | 单张图片推理，响应默认 XML，可用 `response_format` / `Accept` 切 JSON |
+| `POST /v1/pose/cancel` | 按 `request_id` 取消排队/进行中的推理（JSON） |
+| `POST /v2/pose/cancel` | 同上（XML） |
+
+#### 请求字段
+
+请求体支持 **JSON**、**v2 `poseRequest` XML**、**multipart/form-data**（图片文件 + 其余字段同名文本）。XML 根节点必须为 `poseRequest`。
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `image` | string | 是 | - | 三种格式任选：Base64 data URI、HTTP(S) URL、服务端本地文件路径（可用 `image_path` 代替） |
+| `request_id` | string | 否 | 自动生成 | 自定义任务号，用于 `/v1|v2/pose/cancel` 与日志关联 |
+| `engine` | string | 否 | `sam3d_vitpose` | 仅支持该值；其它值返回 **200 + `status=error`**（与参考实现一致） |
+| `want_overlay` | bool | 否 | `true` | 返回 COCO-17 2D 骨架叠加图（`overlay_jpeg_b64`，**裸 Base64**，无 `data:image` 前缀）；`world.status=ok` 时先叠加检测到的地平面网格 |
+| `want_raw` | bool | 否 | `false` | 返回 SAM3D 原始输出（127 关节、旋转、关键点、`pred_cam_t` 等），字段与参考实现同名 |
+| `want_world` | bool | 否 | **`true`** | 返回地面世界系 `world` 块；地面未就绪时 `world.status=skipped`，其余字段照常 |
+| `want_mesh` | bool | 否 | `false` | `world.mesh` 返回世界系网格顶点/面（约 1.8 万顶点，体积大，按需开启） |
+| `ground_mode` | string | 否 | `auto` | `auto`=有 `ground` 就用、否则推理；`request`=必须传 `ground`；`infer`=强制推理（未就绪 503）；`none`=不算换世界系 |
+| `ground` | object | 否 | - | `{"plane_normal": [x,y,z], "plane_d": d}`（相机系 `n·p+d=0`）或 `{"rotation": 3×3, "translation": [x,y,z]}`，可把 `/v1/ground` 的返回值直接透传 |
+| `ground_infer_prompts` | object | 否 | 服务默认 | `{"floor_prompt": "floor, wooden floor."}`，仅在需要推理地面时生效 |
+| `retarget_schema` | string | 否 | `auto` | `auto`/`v4`/`v3`/`v1`；`v1` 只返回基础骨架，不做目标骨架重定向 |
+| `target_tpose_bundle` | object | 否 | 默认 Biped | 自定义目标骨架包：`{"text", "schema", "encoding", "fingerprint"}`；不传时用内建标准 Biped（`target_status=default`） |
+| `target_fingerprint` | string | 否 | - | 校验服务端 profile 指纹 |
+| `response_format` | string | 否 | `xml`（v2） | `xml` / `json`，仅 v2 生效 |
+
+```bash
+# 只发图片：默认 want_world=true，自动推理地面并返回地面世界系姿势
+curl -X POST http://127.0.0.1:8004/v1/pose/single \
+  -H "Content-Type: application/json" \
+  -d '{"image": "/mnt/g/UGit/Phy-SIC/images/man_exercise2.jpg"}'
+
+# 复用已算好的地面参数（推荐批量场景），并关闭叠加图
+curl -X POST http://127.0.0.1:8004/v1/pose/single \
+  -H "Content-Type: application/json" \
+  -d '{"image": "data:image/jpeg;base64,...", "want_overlay": false,
+       "ground_mode": "request", "ground": {"plane_normal": [0.02, 0.955, 0.296], "plane_d": -1.114}}'
+
+# v2 XML 请求（也可用 multipart 上传图片）
+curl -X POST http://127.0.0.1:8004/v2/pose/single \
+  -H "Content-Type: application/xml" \
+  -d '<poseRequest><image>/data/demo.jpg</image><want_world>true</want_world>
+       <ground nx="0.02" ny="0.955" nz="0.296" d="-1.114"/></poseRequest>'
+```
+
+#### 响应字段（JSON，v1/v2 共用主体）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `status` | string | `success` / `cancelled` / `error` |
+| `engine` | string | `sam3d_vitpose` |
+| `skeleton_source` | string | `MHR127_direct`（MHR-127 → SMPL-24） |
+| `joints_3d` | number[24][3] | `ground_world_v1` 世界系位置，米；已含落地平移，与 `world.joints_3d` 相同（`world` 不可用时回落 `figure_v6`） |
+| `joints_3d_frame` / `joints_3d_unit` | string | `ground_world_v1` / `meter`（回落时为 `figure_v6` / `meter`） |
+| `confidence` / `valid_joints` | number[24] / int | 关节置信度 |
+| `keypoints_2d_coco17` | number[17][3] | 图像像素坐标 + 分数 |
+| `keypoints_3d_coco17` | number[17][3] | `ground_world_v1` 世界系 3D 关键点，米，与 `world.keypoints_3d_coco17` 相同；`keypoints_3d_coco17_frame` 标注坐标系 |
+| `camera` | object | SAM3D 相机估计（内参为模型默认 FOV，非实测标定）；**相机系**，不随骨骼字段换基 |
+| `generic_pose` | object | 参考同构的 127 关节载荷（`pred_joint_coords` / `pred_global_rots` / `global_rot` …），已换基到 `ground_world_v1`（与 `world.generic_pose` 相同） |
+| `bip22_joints` / `bip22_conf` / `bip22_source` / `bip22_height_m` / `bip22_facing` | - | CS 的 22 骨位置，**`ground_world_v1` 世界系、米**（与 `world.bip22_joints` 相同，`[0]` 为落地 root `z=0`）；`bip22_facing` 为世界系方向向量 |
+| `cs` | object | Character Studio 载荷（`pose_payload`、`points_53`、`bip22_payload` …）；标量值 `frame=ground_world_v1`、`unit=centimeter`，前 22 行关节与 `bip22_joints*100` 逐项一致 |
+| `retarget` | object \| null | 目标骨架重定向结果（`schema_version=bip22_pose_v5`，27 骨，`root` + `bones`，每骨 `global_rotation` / `local_rotation` / `position`）；`frame` / `position_space` 为 `ground_world_v1`，`position` 已含落地平移 |
+| `retarget_status` / `retarget_schema` / `retarget_diagnostics` | - | 重定向状态、实际 schema（`auto` 实测解析为 `v4`）、映射诊断 |
+| `target_status` / `target_fingerprint` / `target_diagnostics` | - | `default`（内建 Biped）/ `provided` / `rejected` / `not_provided` |
+| `profile_rest` / `profile_rest_scope` | - | 目标骨架 rest 姿态（`scope=mapped`） |
+| `world` | object | **地面世界系**结果，仅 `want_world=true` 且 `ground_mode!=none`，见下 |
+| `camera_space` | object | **相机锚定回退**：`want_mesh=true` 且 `world` 不可用时返回，见下 |
+| `overlay_jpeg_b64` | string | `want_overlay=true` 时的 JPEG **裸 Base64**（失败写 `overlay_error`）；`world.status=ok` 时图中叠加地平面网格，`want_world=false` 或地面 `skipped` 时只有骨架 |
+| `request_id` / `time_ms` | string / number | 任务号与本次耗时 |
+| `error` | string | 失败原因 |
+
+> 叠加图内容：`world.status=ok` 时先用 `world.rotation` / `world.plane_normal_camera` / `world.plane_d_camera` 与 `camera.focal_px` 把地平面网格投影到图像（橙色细线、55% 混合，网格与世界轴对齐并以世界原点对齐线段），再画 COCO-17 骨架；因此在同一张图里可直接核对骨架是否站在检测到的地面上。网格仅在 `want_world=true`（默认）且地面成功时绘制，`ground_mode=none` 或 `world.status=skipped/error` 时只返回骨架图。
+
+#### `world` 块（地面世界系）
+
+与 `/v1/ground` 的 `world` 分组**同源**：同一 `rotate_to_up(plane_normal)` 与 `plane_d`，`ground_normal_world≈[0,0,-1]`、`up_axis_world≈[0,0,1]`、地面 `z=0`。
+
+| 字段 | 说明 |
+|---|---|
+| `status` | `ok` / `skipped`（`ground_mode=none` 或地面推理不可用）/ `error`；非 `ok` 时只有 `error` 与坐标系元数据 |
+| `source` | `inferred` / `request_plane` / `request_transform` |
+| `rotation` / `translation` | 相机→世界：`p_world = p_cam @ rotation.T + translation` |
+| `plane_normal_camera` / `plane_d_camera` / `camera_height_m` / `camera_position` | 相机系平面参数与相机光心世界坐标（测量值，不随落地平移改变） |
+| `ground_snap` | 落地结果：`status`（`applied`/`skipped`）、`source`（`sam3d_mesh`=按 SAM-3D 网格最低点 / `joints`=网格缺失时回退关节关键点 / `none`）、`offset_m`（沿世界 +Z 的刚体平移量）；注意与 `/v1/ground` 的 `mesh.alignment.ground_snap`（网格配准接触落位报告）同名但语义不同 |
+| `min_z_m` | 落地后人物最低点（关节/重定向骨/网格），正常情况下 ≈0；不含恒为 0 的 `Bip001 root` |
+| `joints_3d` | number[24][3]，世界系、米，已叠加 `pred_cam_t` 与落地平移 |
+| `keypoints_3d_coco17` | number[17][3]，世界系、米 |
+| `bip22_joints` | number[22][3]，世界系、米；已补回 CS 的「脚底对齐」平移，逐骨与 `joints_3d` 重合（脚趾取自 MHR-70，毫米级差异），`[0]` 为落地 root（`z=0`） |
+| `generic_pose` / `retarget` | 同源载荷的世界系副本：位置换基，`global_rotation` / `local_rotation` 均按共轭换算 |
+| `mesh` | 仅 `want_mesh=true`：`vertices`（世界系、米）+ `faces` |
+
+> **落地（ground snap）在 SAM-3D 源数据上完成**，不在世界系二次平移：先算出沿世界 +Z 的位移 `dz`（使 SAM-3D 网格最低点落在 `z=0`，网格缺失时回退关节/关键点最低点），把对应的相机系向量 `shift_cam` 直接加到 `pred_joint_coords` / `mhr_joint_coords` / `pred_keypoints_3d` / `pred_vertices` 上（`pred_cam_t` 不变），之后所有下游派生量——顶层 `joints_3d`、`keypoints_3d_coco17`、`generic_pose`、`cs`、`retarget` 以及 `world.*`——天然同一高度，姿势可视化与世界系可视化不会错位。`world` 的几何按三步生成：① 落地后的源数据按 `figure_v6`/相机系规则派生；② 换基到 `ground_world_v1`；③ 叠加 `pred_cam_t`。因换基矩阵满足 `Q·shift_cam = (0,0,dz)`，结果与世界系直接 +Z 平移 `dz` 等价。落地只是刚体平移，不改肢体相对关系、不改旋转，也不改 `rotation`/`translation`/`plane_d_camera` 等相机-地面测量值；位移量见 `ground_snap.offset_m`。`want_world=false`、`ground_mode=none` 或地面不可用时不做落地，返回的是 SAM-3D 原始高度。
+
+> 顶层 `joints_3d` / `keypoints_3d_coco17` / `generic_pose` / `retarget` / `bip22_joints` / `cs` 与 `world` 内的同名副本**逐项一致**（都是 `ground_world_v1`，米；`cs` 为厘米），客户端按世界系解析即可，无需再自行换基。`world` 不可用（`want_world=false`、`ground_mode=none` 或地面推理失败）时才回落到 `figure_v6`，此时所有 `*_frame` 标注如实为 `figure_v6`；`camera` 始终是相机系。
+
+#### `camera_space` 块（相机锚定回退）
+
+地面不可信（`want_world=false`，或地面推理失败导致 `world.status!=ok`）且 `want_mesh=true` 时返回。**全程不做地面平面换基、不做落地平移**，只给出 SAM-3D 原始几何在相机系的表示。
+
+| 字段 | 说明 |
+|---|---|
+| `frame` / `unit` / `convention` | `camera_v1` / `meter` / `x right, y down, z forward` |
+| `pred_cam_t` | `[3]`，SAM-3D 模型系 -> 相机系的平移 |
+| `vertices` | number[N][3]，相机系、米（`pred_vertices + pred_cam_t`） |
+| `faces` | number[M][3]，三角面索引 |
+| `keypoints_3d_coco17` | number[17][3]，相机系、米（`pred_keypoints_3d + pred_cam_t`，与网格同系，可直接叠画） |
+
+> 顶点与关键点都来自 SAM-3D 模型系，统一加 `pred_cam_t` 后落在相机系，因此骨架与网格天然重合。此时顶层 `joints_3d` / `keypoints_3d_coco17` 等仍为 `figure_v6`（未落地），需要相机系可视化时请直接用本块。
+
+#### v2 XML 响应
+
+`POST /v2/pose/single` 默认返回 `application/xml`：`<poseResponse api_version="3">` 内含 `<poseResult>`（状态、关节、重定向骨、`<restProfile>` 等），并在根节点末尾（`</poseResponse>` 之前）插入本项目扩展的 `<worldPose>`；`<csPose>` 与 `<targetPose>` 的 `frame` 同样是 `ground_world_v1`（`csPose` 额外标注 `unit="centimeter"`）：
+
+```xml
+<?xml version='1.0' encoding='utf-8'?>
+<poseResponse api_version="3">
+  <poseResult version="1"> ... </poseResult>
+  <restProfile ...> ... </restProfile>
+  <worldPose frame="ground_world_v1" unit="meter" source="inferred" status="ok">
+    <transform rotation="..." translation="0.000000 0.000000 1.114000"/>
+    <joints count="24">
+      <joint index="0" x="..." y="..." z="..."/>
+    </joints>
+    <bones count="27">
+      <bone name="Bip001 Pelvis">
+        <global matrix="..."/>
+        <local matrix="..."/>
+        <position x="..." y="..." z="..."/>
+      </bone>
+    </bones>
+  </worldPose>
+  <overlay>...</overlay>
+</poseResponse>
+```
+
+#### 健康检查与取消
+
+```json
+// GET /v1/pose/health（/v2/pose/health 为同内容的 poseHealth XML）
+{
+  "status": "healthy",             // healthy / disabled（Max 客户端兼容 ok）
+  "engine": "sam3d_vitpose",
+  "api_version": 3,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "cuda": true,
+  "models": {"sam3d": "sam-3d-body-vith", "vitpose": "disabled"},
+  "world": {"ready": true, "segmenter": true, "depth": true},
+  "retarget": {"ready": true, "skeleton_id": "mhr_biped_standard", "bone_count": 66, "mapping_bone_count": 27, "fingerprint": "sha256:...", "chains": ["spine", "neck", "finger_L_Finger0", "finger_L_Finger1", "finger_R_Finger0", "finger_R_Finger1"]},
+  "endpoints": ["GET /v1/pose/health", "..."],
+  "disabled_reason": "",
+  "skeleton_source": "MHR127_direct"
+}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8004/v1/pose/cancel -H "Content-Type: application/json" \
+  -d '{"request_id": "6f87f78bbb8b44cbb80cf874365e5258"}'
+# 200 {"request_id": "...", "cancelled": true}
+# 404 {"request_id": "...", "cancelled": false, "error": "未找到任务"}
+```
+
+推理本身是同步的：`request_id` 只在请求执行期间登记，取消用于释放排队等待与中途放弃，已返回的 200 响应不会被改写。同一时刻只允许一个姿势任务占用 GPU，并发请求返回 503 `GPU 忙，请稍后重试`。
+
+#### 错误响应
+
+| HTTP | 触发条件 |
+|---|---|
+| `400` | JSON/XML 解析失败、字段类型非法、`ground_mode` 不支持、`ground_mode=request` 但缺 `ground`、bundle 校验失败（`target_status=rejected`） |
+| `404` | `cancel` 的 `request_id` 未找到 |
+| `413` | 请求体或图片超过 40 MB |
+| `500` | 推理异常、`generic_pose` 组装或重定向失败 |
+| `503` | SAM3D 未配置/加载失败、重定向资产缺失、`ground_mode=infer` 但地面模型未就绪、GPU 忙 |
+
+错误响应体为 `{"status": "error", "engine": "sam3d_vitpose", "error": "stage: ...", "request_id": "...", "target_status": "..."}`（v2 XML 同样生效，错误也按 XML 输出）。
+
+> 业务失败沿用参考实现语义：**HTTP 200 + `status=error`**，包括 `engine` 非法与 SAM3D 未检出人物。调用方应先判断 `status`，不要只看状态码。
+
+#### 与参考 ImagePose_Resources 的兼容范围
+
+依据 `ImagePose_v2/docs/预备移除_旧推理接口与兼容路径_20261021.md`：**在用接口保持兼容，预备移除的旧接口不保证兼容**。
+
+| 类别 | 接口 / 行为 | 说明 |
+|---|---|---|
+| 在用（已对齐） | `GET /v2/pose/health` | `status=healthy/disabled`、`api_version=3` 属性、`gpu` 显卡名、`models` 字段 |
+| 在用（已对齐） | `POST /v2/pose/single`（XML） | `poseRequest` → `poseResponse`；`poseResult` / `csPose`(`applyCharacterStudio`) / `targetPose`(`bip22_pose_v5`) / `restProfile` / `overlay` 均复用参考序列化器 |
+| 在用（已对齐） | `POST /v2/pose/cancel`（XML） | `poseCancel` → `poseCancelResult`，未找到 404 |
+| 在用（已对齐） | `GET /` | 只读服务说明 |
+| 在用（已对齐） | `retarget_schema=v4` + 内联 `target_tpose_bundle` | `target_status=used`，输出 `targetPose` 与 `profile_rest` |
+| 在用（已对齐） | `retarget_schema=v1`（无 bundle 回落） | `target_status=skipped`、`retarget_schema=v1`，无 `targetPose` |
+| 预备移除（不保证） | `POST /v1/pose/single`（JSON）、`POST /v1/pose/cancel` | 保留旧行为，不随参考实现演进 |
+| 预备移除（不保证） | `GET /v1/pose/health`、`GET /health`、`GET /v1/pose/info` | `/health` 在本服务中仍是**地面服务**健康检查，语义与参考不同 |
+| 预备移除（不保证） | `retarget_schema=v3` | 仍接受，输出 `bip22_pose_v5`，后续随参考实现一起移除 |
+
+本项目新增（参考实现没有，不影响旧客户端）：`want_world` / `ground_mode` / `ground` / `want_mesh` 与 `world` / `worldPose` 块；无 bundle 且未指定 `retarget_schema=v1` 时，默认用内建 Biped 重定向（`target_status=default`）。
+
 ---
 
 ## 4. Python 调用示例
