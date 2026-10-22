@@ -1,0 +1,189 @@
+{
+  "health": {
+    "status": "healthy",
+    "engine": "sam3d_vitpose",
+    "gpu": "NVIDIA GeForce RTX 3070",
+    "cuda": true,
+    "models": {
+      "sam3d": "sam-3d-body-vith",
+      "vitpose": "vitpose-base-simple"
+    },
+    "api_version": 3,
+    "endpoints": [
+      "GET /v1/pose/health",
+      "GET /v2/pose/health",
+      "POST /v1/pose/single",
+      "POST /v2/pose/single",
+      "POST /v1/pose/cancel",
+      "POST /v2/pose/cancel"
+    ],
+    "disabled_reason": null
+  },
+  "images": [
+    {
+      "image": "5306c1d3gy1hsktgsqco6j20sg11wq4s.jpg",
+      "status": "success",
+      "time_ms": 5729.0,
+      "valid_joints": 24,
+      "skeleton_source": "MHR127_direct",
+      "focal_px": 1705.6,
+      "camera_translation": [
+        -0.2033,
+        1.2077,
+        2.4836
+      ],
+      "cs_response_status": "ok",
+      "generic_pose_status": "ok",
+      "reproj": {
+        "median_px": 25.08,
+        "mean_px": 25.58,
+        "p90_px": 46.25,
+        "n": 13
+      },
+      "height_m": 0.815,
+      "figure_variant": [
+        -1,
+        -1,
+        1
+      ],
+      "mesh_faces": 36874,
+      "panel": "5306c1d3gy1hsktgsqco6j20sg11wq4s_panels.png",
+      "fbx": {
+        "status": "ok",
+        "file": "5306c1d3gy1hsktgsqco6j20sg11wq4s_pose.fbx",
+        "bytes": 536636,
+        "reused": true
+      },
+      "fbx_mhr": {
+        "status": "ok",
+        "file": "5306c1d3gy1hsktgsqco6j20sg11wq4s_pose_mhr.fbx",
+        "bytes": 1594556,
+        "reused": true
+      }
+    },
+    {
+      "image": "5306c1d3gy1hsktgstrvxj20sg11wgoo.jpg",
+      "status": "success",
+      "time_ms": 2509.2,
+      "valid_joints": 24,
+      "skeleton_source": "MHR127_direct",
+      "focal_px": 1705.6,
+      "camera_translation": [
+        0.3229,
+        0.8196,
+        2.1362
+      ],
+      "cs_response_status": "ok",
+      "generic_pose_status": "ok",
+      "reproj": {
+        "median_px": 25.55,
+        "mean_px": 34.12,
+        "p90_px": 67.45,
+        "n": 13
+      },
+      "height_m": 1.342,
+      "figure_variant": [
+        -1,
+        -1,
+        1
+      ],
+      "mesh_faces": 36874,
+      "panel": "5306c1d3gy1hsktgstrvxj20sg11wgoo_panels.png",
+      "fbx": {
+        "status": "ok",
+        "file": "5306c1d3gy1hsktgstrvxj20sg11wgoo_pose.fbx",
+        "bytes": 536636,
+        "reused": true
+      },
+      "fbx_mhr": {
+        "status": "ok",
+        "file": "5306c1d3gy1hsktgstrvxj20sg11wgoo_pose_mhr.fbx",
+        "bytes": 1594556,
+        "reused": true
+      }
+    },
+    {
+      "image": "5306c1d3gy1hsktgsw6d1j20sg11wgon.jpg",
+      "status": "success",
+      "time_ms": 2106.8,
+      "valid_joints": 24,
+      "skeleton_source": "MHR127_direct",
+      "focal_px": 1705.6,
+      "camera_translation": [
+        0.1371,
+        0.8779,
+        2.2717
+      ],
+      "cs_response_status": "ok",
+      "generic_pose_status": "ok",
+      "reproj": {
+        "median_px": 20.44,
+        "mean_px": 30.42,
+        "p90_px": 66.06,
+        "n": 13
+      },
+      "height_m": 1.436,
+      "figure_variant": [
+        -1,
+        -1,
+        1
+      ],
+      "mesh_faces": 36874,
+      "panel": "5306c1d3gy1hsktgsw6d1j20sg11wgon_panels.png",
+      "fbx": {
+        "status": "ok",
+        "file": "5306c1d3gy1hsktgsw6d1j20sg11wgon_pose.fbx",
+        "bytes": 536636,
+        "reused": true
+      },
+      "fbx_mhr": {
+        "status": "ok",
+        "file": "5306c1d3gy1hsktgsw6d1j20sg11wgon_pose_mhr.fbx",
+        "bytes": 1594556,
+        "reused": true
+      }
+    },
+    {
+      "image": "5306c1d3gy1hsktgsz459j20sg0ugmyv.jpg",
+      "status": "success",
+      "time_ms": 2225.1,
+      "valid_joints": 24,
+      "skeleton_source": "MHR127_direct",
+      "focal_px": 1499.93,
+      "camera_translation": [
+        0.1384,
+        1.1405,
+        2.2258
+      ],
+      "cs_response_status": "ok",
+      "generic_pose_status": "ok",
+      "reproj": {
+        "median_px": 22.96,
+        "mean_px": 23.79,
+        "p90_px": 40.37,
+        "n": 13
+      },
+      "height_m": 0.665,
+      "figure_variant": [
+        -1,
+        -1,
+        1
+      ],
+      "mesh_faces": 36874,
+      "panel": "5306c1d3gy1hsktgsz459j20sg0ugmyv_panels.png",
+      "fbx": {
+        "status": "ok",
+        "file": "5306c1d3gy1hsktgsz459j20sg0ugmyv_pose.fbx",
+        "bytes": 536636,
+        "reused": true
+      },
+      "fbx_mhr": {
+        "status": "ok",
+        "file": "5306c1d3gy1hsktgsz459j20sg0ugmyv_pose_mhr.fbx",
+        "bytes": 1594556,
+        "reused": true
+      }
+    }
+  ],
+  "cases": {}
+}
