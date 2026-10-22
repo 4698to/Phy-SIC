@@ -1640,6 +1640,18 @@ def create_ground_app(
                 "overlay": _overlay_png(rgb, floor_mask, result["plane_inlier_mask"], person_mask, contact_mask),
             }
             mesh_included = pose_mesh_points is not None and pose_mesh_faces is not None
+            if mesh_included:
+                # 世界系网格：与 world 分组、visualization.views / pose_world 使用同一 R 与 z 偏移
+                mesh_rotation = rotate_to_up(np.asarray(result["plane_normal"], dtype=float))
+                mesh_world = pose_mesh_points @ mesh_rotation.T
+                mesh_world[:, 2] -= float(result["plane_d"])
+                pose["mesh_world"] = {
+                    "vertices": np.round(mesh_world, 4).astype(float).tolist(),
+                    "faces": pose_mesh_faces.astype(int).tolist(),
+                    "vertex_count": int(len(mesh_world)),
+                    "face_count": int(len(pose_mesh_faces)),
+                    "aligned": bool(mesh_aligned),
+                }
             try:
                 visualization["views"] = _ground_views_png(
                     depth,
@@ -1797,6 +1809,9 @@ def create_ground_app(
             "plane_normal": wf["plane_normal"].tolist(),
             "plane_d": wf["plane_d"],
             "camera_height_m": wf["camera_height_m"],
+            # 相机系 -> 世界系变换：p_world = p_cam @ rotation.T + translation，与可视化完全一致
+            "rotation": wf["rotation"].astype(float).tolist(),
+            "translation": (np.array([0.0, 0.0, -float(result["plane_d"])], dtype=float)).tolist(),
             "plane_points": wf["plane_points"].astype(float).tolist(),
             "inlier_points": wf["inlier_points"].astype(float).tolist(),
         }
