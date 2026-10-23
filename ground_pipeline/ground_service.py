@@ -11,9 +11,11 @@ ground_pipeline 地面提取服务
 import argparse
 import base64
 import cv2
+import copy
 import io
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -36,7 +38,7 @@ from ground_pipeline.ground_retarget import (
     GroundTransform,
     RetargetAdapter,
     RetargetError,
-    apply_world_frames,
+    apply_gravity_alignment,
     build_world_block,
     insert_world_xml,
     landing_shift,
@@ -1495,7 +1497,7 @@ def _pose_parse_request_xml(raw: bytes) -> Dict[str, Any]:
         text = _pose_xml_text(root, key)
         if text:
             data[key] = text
-    for key in ("want_overlay", "want_raw", "want_world", "want_mesh"):
+    for key in ("want_overlay", "want_raw", "want_world", "want_mesh", "align_gravity"):
         text = _pose_xml_text(root, key)
         if text is not None and text != "":
             data[key] = text
@@ -1859,16 +1861,8 @@ def _pose_resolve_ground(
     return transform, "ok", None
 
 
-# 落地平移作用于 SAM-3D 的模型系坐标（相对量 + pred_cam_t）
-_POSE_RAW_POSITION_FIELDS = ("pred_joint_coords", "mhr_joint_coords", "pred_keypoints_3d", "pred_vertices")
-
-
 def _pose_apply_landing(transform: GroundTransform, raw: Dict[str, Any]) -> Dict[str, Any]:
-    """把 SAM-3D 源数据整体沿世界 +Z 平移到地面，返回落地报告。
-
-    在 ``assemble_pose`` 之前调用：关节、关键点、网格、重定向、generic_pose 与世界系
-    全部由落地后的 SAM-3D 结果派生，因此下游各字段天然同一高度。
-    """
+    """Return the legacy ground snap plus an isolated, landed raw pose for world diagnostics."""
     snap = landing_shift(
         transform,
         mesh_vertices=raw.get("pred_vertices"),
@@ -1878,19 +1872,16 @@ def _pose_apply_landing(transform: GroundTransform, raw: Dict[str, Any]) -> Dict
         keypoints_3d=raw.get("pred_keypoints_3d"),
         pred_cam_t=raw.get("pred_cam_t"),
     )
-    shift = np.asarray(snap.pop("shift_cam"), dtype=np.float64).reshape(3)
+    diagnostic_raw = copy.deepcopy(raw)
+    shift_cam = np.asarray(snap.get("shift_cam", np.zeros(3)), dtype=np.float64).reshape(3)
     if snap.get("status") == "applied":
-        for key in _POSE_RAW_POSITION_FIELDS:
-            value = raw.get(key)
-            if value is None:
-                continue
-            arr = np.asarray(value, dtype=np.float64)
-            if arr.ndim != 2 or arr.shape[-1] < 3:
-                continue
-            moved = arr.copy()
-            moved[:, :3] += shift
-            raw[key] = moved.tolist()
-    return snap
+        for key in ("pred_vertices", "mhr_joint_coords", "pred_joint_coords", "pred_keypoints_3d"):
+            if diagnostic_raw.get(key) is not None:
+                arr = np.asarray(diagnostic_raw[key], dtype=np.float64)
+                diagnostic_raw[key] = (arr.reshape(-1, 3) + shift_cam).reshape(arr.shape).tolist()
+    snap.pop("shift_cam", None)
+    return {"report": snap, "raw": diagnostic_raw}
+
 
 
 def _pose_resolve_world(
@@ -2042,6 +2033,7 @@ def _pose_single_pipeline(
         want_raw = _pose_as_bool(data.get("want_raw"), False)
         want_world = _pose_as_bool(data.get("want_world"), True)
         want_mesh = _pose_as_bool(data.get("want_mesh"), False)
+        align_gravity = _pose_as_bool(data.get("align_gravity"), want_world)
     except ValueError as exc:
         return 400, _pose_error_body(str(exc), request_id=request_id)
 
@@ -2141,7 +2133,9 @@ def _pose_single_pipeline(
         ground_status = "skipped"
         ground_error: Optional[str] = None
         landing: Optional[Dict[str, Any]] = None
-        if want_world:
+        world_raw = raw
+        run_ground = want_world or align_gravity
+        if run_ground:
             try:
                 ground_transform, ground_status, ground_error = _pose_resolve_ground(
                     state,
@@ -2151,9 +2145,13 @@ def _pose_single_pipeline(
                     default_floor_prompt=state.get("floor_prompt") or DEFAULT_FLOOR_PROMPT,
                 )
             except RetargetError as exc:
-                return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+                if want_world:
+                    return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+                ground_status, ground_error = "error", str(exc)
             if ground_transform is not None:
-                landing = _pose_apply_landing(ground_transform, raw)
+                landing_state = _pose_apply_landing(ground_transform, raw)
+                landing = landing_state["report"]
+                world_raw = landing_state["raw"]
 
         try:
             body, internal = adapter.assemble_pose(
@@ -2192,14 +2190,25 @@ def _pose_single_pipeline(
                 return 200, _pose_cancelled_body(rid)
             if ground_transform is not None:
                 try:
+                    world_body, world_internal = adapter.assemble_pose(
+                        world_raw,
+                        pose.get("camera") or {},
+                        want_raw=False,
+                        require_generic=target.get("schema") != "v1",
+                        bbox=pose.get("bbox_2d_xyxy"),
+                    )
+                    if target.get("schema") not in (None, "", "v1"):
+                        world_retarget = adapter.retarget(world_internal.get("generic") or {}, target)
+                        if world_retarget:
+                            world_body["retarget"] = world_retarget["payload"]
                     world = _pose_resolve_world(
                         state,
                         transform=ground_transform,
                         ground_mode=ground_mode,
-                        internal=internal,
-                        body=body,
+                        internal=world_internal,
+                        body=world_body,
                         want_mesh=want_mesh,
-                        raw=raw,
+                        raw=world_raw,
                         ground_snap=landing,
                     )
                 except RetargetError as exc:
@@ -2207,9 +2216,55 @@ def _pose_single_pipeline(
             else:
                 world = skipped_world(ground_status, ground_mode=ground_mode, error=ground_error)
             body["world"] = world
-            # 返回给客户端的骨骼字段统一改为 ground_world_v1（world 不可用时保持 figure 原值）
-            if world.get("status") == "ok":
-                apply_world_frames(body, world, ground_transform, internal.get("pred_cam_t"))
+
+        alignment_report: Dict[str, Any]
+        if align_gravity and ground_transform is not None:
+            try:
+                alignment_report = apply_gravity_alignment(
+                    body,
+                    ground_transform,
+                    pred_cam_t=internal.get("pred_cam_t"),
+                    mesh_vertices=raw.get("pred_vertices"),
+                )
+                body["gravity_aligned"] = True
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                alignment_report = {"status": "error", "source": "none", "error": str(exc)}
+                body["gravity_aligned"] = False
+                body.setdefault("warnings", []).append(f"gravity alignment skipped: {exc}")
+        else:
+            alignment_report = {
+                "status": "skipped" if not align_gravity else ground_status,
+                "source": "none",
+                "error": ground_error if align_gravity else None,
+            }
+            body["gravity_aligned"] = False
+            if align_gravity:
+                body.setdefault("warnings", []).append(
+                    f"gravity alignment unavailable: {ground_error or 'ground transform unavailable'}"
+                )
+        finite_angle = alignment_report.get("angle_deg")
+        if finite_angle is not None:
+            try:
+                finite_angle = float(finite_angle)
+            except (TypeError, ValueError):
+                finite_angle = None
+            if finite_angle is not None and not math.isfinite(finite_angle):
+                finite_angle = None
+        alignment_report["angle_deg"] = finite_angle
+        body["align_angle_deg"] = finite_angle
+        body["gravity_alignment"] = alignment_report
+        cs_output = body.get("cs")
+        if isinstance(cs_output, dict):
+            cs_output["gravity_aligned"] = body["gravity_aligned"]
+            cs_output["align_angle_deg"] = finite_angle
+            pose_payload = cs_output.get("pose_payload")
+            if isinstance(pose_payload, dict):
+                pose_payload["gravity_aligned"] = body["gravity_aligned"]
+                pose_payload["align_angle_deg"] = finite_angle
+        retarget_output = body.get("retarget")
+        if isinstance(retarget_output, dict):
+            retarget_output["gravity_aligned"] = body["gravity_aligned"]
+            retarget_output["align_angle_deg"] = finite_angle
 
         # 无可靠世界系（want_world=false 或地面推理失败）时，额外给出相机锚定回退块
         if want_mesh and (world is None or world.get("status") != "ok"):
@@ -2837,6 +2892,20 @@ def create_ground_app(
         def emit(code: int, body: Dict[str, Any]) -> Response:
             if v2 and serializer is not None:
                 content, media = serializer.serialize_v2_response(body, response_format=fmt)
+                if fmt == "xml":
+                    xml_root = ET.fromstring(content)
+                    aligned = "true" if body.get("gravity_aligned") else "false"
+                    angle = body.get("align_angle_deg")
+                    angle_text = "" if angle is None else f"{float(angle):.6f}"
+                    for element in [xml_root, *list(xml_root)]:
+                        if element.tag not in ("poseResult", "csPose", "targetPose"):
+                            continue
+                        element.set("gravity_aligned", aligned)
+                        element.set("align_angle_deg", angle_text)
+                        if element.tag == "poseResult":
+                            ET.SubElement(element, "gravity_aligned").text = aligned
+                            ET.SubElement(element, "align_angle_deg").text = angle_text
+                    content = ET.tostring(xml_root, encoding="utf-8", xml_declaration=True)
                 if fmt == "xml" and isinstance(body.get("world"), dict):
                     content = insert_world_xml(content.decode("utf-8"), body["world"]).encode("utf-8")
                     media = "application/xml; charset=utf-8"

@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -792,6 +793,307 @@ def _bip22_anchor(joints_fig, bip22_joints, sources) -> Optional[np.ndarray]:
     if len(deltas) < 3:
         return None
     return np.median(np.stack(deltas), axis=0)
+
+
+def alignment_rotation(transform: GroundTransform) -> Tuple[np.ndarray, float]:
+    """Return the proper rotation that maps figure-space ground-up onto +Z."""
+    up = FIGURE_P @ np.asarray(transform.rotation, dtype=np.float64).T @ np.array([0.0, 0.0, 1.0])
+    up /= np.linalg.norm(up)
+    cosine = float(np.clip(up[2], -1.0, 1.0))
+    angle = math.acos(cosine)
+    if cosine < -0.999999:
+        raise ValueError("ground up is nearly opposite to figure +Z")
+    if angle < 1e-12:
+        return np.eye(3, dtype=np.float64), 0.0
+    axis = np.cross(up, np.array([0.0, 0.0, 1.0]))
+    axis /= np.linalg.norm(axis)
+    skew = np.array(
+        [[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]],
+        dtype=np.float64,
+    )
+    rotation = np.eye(3) + math.sin(angle) * skew + (1.0 - math.cos(angle)) * (skew @ skew)
+    return rotation, math.degrees(angle)
+
+
+def apply_gravity_alignment(
+    body: Dict[str, Any],
+    transform: GroundTransform,
+    *,
+    pred_cam_t=None,
+    mesh_vertices=None,
+) -> Dict[str, Any]:
+    """Align all consumer pose values to figure +Z, then place the selected geometry on z=0."""
+    from ai_vitpose.core.generic_pose import _euler_zyx_to_rotmat, _rotmat_to_euler_zyx
+
+    original_body = body
+    body = copy.deepcopy(body)
+    rotation, angle_deg = alignment_rotation(transform)
+    joints = np.asarray(body.get("joints_3d", []), dtype=np.float64).reshape(-1, 3)
+    if not len(joints):
+        raise ValueError("pose has no joints for gravity alignment pivot")
+    pivot = joints[0].copy()
+
+    def align_points(points, origin, scale=1.0):
+        arr = np.asarray(points, dtype=np.float64)
+        return ((arr - origin) @ rotation.T + origin).reshape(arr.shape) * scale
+
+    joints = align_points(joints, pivot)
+    body["joints_3d"] = joints.tolist()
+    body["joints_3d_frame"] = FRAME_FIGURE
+
+    kp = body.get("keypoints_3d_coco17")
+    if kp is not None:
+        kp_figure = np.asarray(kp, dtype=np.float64).reshape(-1, 3) @ FIGURE_P.T
+        body["keypoints_3d_coco17"] = align_points(kp_figure, pivot).tolist()
+        body["keypoints_3d_coco17_frame"] = FRAME_FIGURE
+
+    generic = body.get("generic_pose")
+    if isinstance(generic, dict):
+        generic = dict(generic)
+        generic_points = np.asarray(generic.get("pred_joint_coords", [pivot]), dtype=np.float64).reshape(-1, 3)
+        generic_pivot = generic_points[1].copy() if len(generic_points) > 1 else pivot
+        for key in ("pred_joint_coords", "pred_keypoints_3d"):
+            if generic.get(key) is not None:
+                generic[key] = align_points(generic[key], generic_pivot).tolist()
+        if generic.get("pred_global_rots") is not None:
+            generic["pred_global_rots"] = np.stack(
+                [rotation @ np.asarray(m, dtype=np.float64).reshape(3, 3)
+                 for m in generic["pred_global_rots"]]
+            ).tolist()
+        if generic.get("global_rot") is not None:
+            old = _euler_zyx_to_rotmat(np.asarray(generic["global_rot"], dtype=np.float64).reshape(3))
+            generic["global_rot"] = _rotmat_to_euler_zyx(rotation @ old).tolist()
+        generic["frame"] = FRAME_FIGURE
+        body["generic_pose"] = generic
+
+    retarget = body.get("retarget")
+    if isinstance(retarget, dict):
+        retarget = dict(retarget)
+        bones = {}
+        for name, row in (retarget.get("bones") or {}).items():
+            if not isinstance(row, dict):
+                bones[name] = row
+                continue
+            item = dict(row)
+            if item.get("global_rotation") is not None:
+                item["global_rotation"] = (rotation @ np.asarray(item["global_rotation"], dtype=np.float64).reshape(3, 3)).tolist()
+            if item.get("position") is not None:
+                item["position"] = (rotation @ (np.asarray(item["position"], dtype=np.float64).reshape(3) - pivot) + pivot).tolist()
+            bones[name] = item
+        retarget["bones"] = bones
+        root = retarget.get("root")
+        if isinstance(root, dict):
+            root = dict(root)
+            if root.get("position") is not None:
+                root["position"] = (rotation @ (np.asarray(root["position"], dtype=np.float64).reshape(3) - pivot) + pivot).tolist()
+            root_bone = root.get("bone")
+            if root_bone in bones and isinstance(bones[root_bone], dict) and bones[root_bone].get("position") is not None:
+                root["position"] = copy.deepcopy(bones[root_bone]["position"])
+            retarget["root"] = root
+        retarget["frame"] = FRAME_FIGURE
+        retarget["position_space"] = "figure_v6_world"
+        body["retarget"] = retarget
+
+    cs = body.get("cs")
+    cs = dict(cs) if isinstance(cs, dict) else None
+    if cs is not None:
+        pelvis_cm = np.asarray(cs.get("bip22_joints", [])[1], dtype=np.float64) if len(cs.get("bip22_joints", [])) > 1 else pivot * 100.0
+
+        def cs_point(point):
+            return (rotation @ (np.asarray(point, dtype=np.float64).reshape(3) / 100.0 - pelvis_cm / 100.0) + pelvis_cm / 100.0) * 100.0
+
+        def cs_direction(vector):
+            return (rotation @ np.asarray(vector, dtype=np.float64).reshape(3)).tolist()
+
+        bip = cs.get("bip22_joints")
+        aligned_bip = None
+        if isinstance(bip, list) and bip:
+            aligned_bip = np.asarray(bip, dtype=np.float64).reshape(-1, 3)
+            aligned_bip = (aligned_bip / 100.0 - pelvis_cm / 100.0) @ rotation.T * 100.0 + pelvis_cm
+            if len(aligned_bip) > 1:
+                aligned_bip[0] = [aligned_bip[1, 0], aligned_bip[1, 1], 0.0]
+            cs["bip22_joints"] = aligned_bip.tolist()
+        pelvis_xy_cm = aligned_bip[1, :2].copy() if aligned_bip is not None and len(aligned_bip) > 1 else None
+        for payload_key in ("pose_payload", "bip22_payload"):
+            payload = cs.get(payload_key)
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list) or not payload["data"]:
+                continue
+            payload = dict(payload)
+            rows = list(payload["data"])
+            if isinstance(rows[0], list):
+                values = np.asarray(rows[0], dtype=np.float64).reshape(-1, 3)
+                values = (values / 100.0 - pelvis_cm / 100.0) @ rotation.T * 100.0 + pelvis_cm
+                if len(values) > 1:
+                    values[0] = [values[1, 0], values[1, 1], 0.0]
+                rows[0] = values.tolist()
+            if payload_key == "pose_payload":
+                for row_index in (1, 2):
+                    if row_index < len(rows) and isinstance(rows[row_index], list):
+                        rows[row_index] = [None if v is None else cs_direction(v) for v in rows[row_index]]
+                for row_index in (3,):
+                    if row_index < len(rows) and rows[row_index] is not None:
+                        rows[row_index] = cs_direction(rows[row_index])
+                if len(rows) > 5 and isinstance(rows[5], list):
+                    rows[5] = [None if hand is None else [cs_direction(v) for v in hand] for hand in rows[5]]
+                if len(rows) > 6 and isinstance(rows[6], list) and rows[6] and rows[6][0] is not None:
+                    center_m = np.asarray(rows[6][0], dtype=np.float64)
+                    center = (rotation @ (center_m - pivot) + pivot).tolist()
+                    rows[6] = [center, *rows[6][1:]]
+            payload["data"] = rows
+            payload["frame"] = FRAME_FIGURE
+            cs[payload_key] = payload
+        if isinstance(cs.get("pose_payload"), dict):
+            cs["pose_data"] = cs["pose_payload"].get("data")
+        if isinstance(cs.get("bip22_payload"), dict):
+            cs["bip22_pose_data"] = cs["bip22_payload"].get("data")
+        if isinstance(cs.get("bip22_facing"), (list, tuple)):
+            cs["bip22_facing"] = cs_direction(cs["bip22_facing"])
+        if isinstance(cs.get("points_53_tsv"), str):
+            lines = cs["points_53_tsv"].splitlines()
+            if lines:
+                headers = lines[0].split("\t")
+                try:
+                    key_i, xyz_i = headers.index("source_key"), [headers.index(k) for k in ("x", "y", "z")]
+                    for i in range(1, len(lines)):
+                        cols = lines[i].split("\t")
+                        if max(xyz_i) < len(cols):
+                            vals = np.array([float(cols[j]) for j in xyz_i])
+                            if np.any(vals) or cols[key_i].strip().lower() == "root":
+                                aligned = cs_point(vals)
+                                if cols[key_i].strip().lower() == "root":
+                                    if pelvis_xy_cm is not None:
+                                        aligned[:2] = pelvis_xy_cm
+                                    aligned[2] = 0.0
+                                for j, val in zip(xyz_i, aligned): cols[j] = f"{val:.6f}"
+                                lines[i] = "\t".join(cols)
+                    cs["points_53_tsv"] = "\n".join(lines) + "\n"
+                except (ValueError, IndexError):
+                    pass
+        points = cs.get("points_53")
+        if isinstance(points, list):
+            aligned_points = []
+            for point in points:
+                if not isinstance(point, dict):
+                    aligned_points.append(point)
+                    continue
+                item = dict(point)
+                xyz = [item.get(key) for key in ("x", "y", "z")]
+                if all(isinstance(value, (int, float)) for value in xyz) and (
+                    any(xyz) or str(item.get("source_key") or "").strip().lower() == "root"
+                ):
+                    aligned = cs_point(xyz)
+                    if str(item.get("source_key") or "").strip().lower() == "root":
+                        if pelvis_xy_cm is not None:
+                            aligned[:2] = pelvis_xy_cm
+                        aligned[2] = 0.0
+                    item.update(zip(("x", "y", "z"), (float(value) for value in aligned)))
+                aligned_points.append(item)
+            cs["points_53"] = aligned_points
+        cs["bip22_facing"] = cs.get("bip22_facing")
+        body["cs"] = cs
+        for key in ("bip22_joints", "bip22_facing", "bip22_conf", "bip22_source", "bip22_height_m"):
+            if key in cs:
+                body[key] = cs[key]
+
+    points_for_floor = []
+    if mesh_vertices is not None:
+        cam_t = np.zeros(3, dtype=np.float64) if pred_cam_t is None else np.asarray(pred_cam_t, dtype=np.float64).reshape(3)
+        mesh_fig = (np.asarray(mesh_vertices, dtype=np.float64).reshape(-1, 3) + cam_t) @ FIGURE_P.T
+        points_for_floor.append((mesh_fig - pivot) @ rotation.T + pivot)
+        floor_source = "sam3d_mesh"
+    else:
+        points_for_floor.append(joints)
+        if kp is not None:
+            points_for_floor.append(np.asarray(body["keypoints_3d_coco17"], dtype=np.float64))
+        floor_source = "joints"
+    dz = -min(float(np.min(points[:, 2])) for points in points_for_floor)
+
+    def shift_positions(points):
+        arr = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        arr[:, 2] += dz
+        return arr.tolist()
+
+    body["joints_3d"] = shift_positions(body["joints_3d"])
+    if body.get("keypoints_3d_coco17") is not None:
+        body["keypoints_3d_coco17"] = shift_positions(body["keypoints_3d_coco17"])
+    generic = body.get("generic_pose")
+    if isinstance(generic, dict):
+        for key in ("pred_joint_coords", "pred_keypoints_3d"):
+            if generic.get(key) is not None:
+                generic[key] = shift_positions(generic[key])
+        body["generic_pose"] = generic
+    retarget = body.get("retarget")
+    if isinstance(retarget, dict):
+        for row in (retarget.get("bones") or {}).values():
+            if isinstance(row, dict) and row.get("position") is not None:
+                row["position"][2] += dz
+        if isinstance(retarget.get("root"), dict) and retarget["root"].get("position") is not None:
+            retarget["root"]["position"][2] += dz
+        body["retarget"] = retarget
+    cs = body.get("cs")
+    if isinstance(cs, dict):
+        cs = dict(cs)
+        if isinstance(cs.get("bip22_joints"), list):
+            bip = np.asarray(cs["bip22_joints"], dtype=np.float64).reshape(-1, 3)
+            bip[:, 2] += dz * 100.0
+            if len(bip):
+                bip[0, 2] = 0.0
+            cs["bip22_joints"] = bip.tolist()
+        for payload_key in ("pose_payload", "bip22_payload"):
+            payload = cs.get(payload_key)
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list) or not payload["data"]:
+                continue
+            payload = dict(payload)
+            rows = list(payload["data"])
+            if isinstance(rows[0], list):
+                arr = np.asarray(rows[0], dtype=np.float64).reshape(-1, 3)
+                arr[:, 2] += dz * 100.0
+                if len(arr):
+                    arr[0, 2] = 0.0
+                rows[0] = arr.tolist()
+            if payload_key == "pose_payload" and len(rows) > 6 and isinstance(rows[6], list) and rows[6] and rows[6][0] is not None:
+                center = np.asarray(rows[6][0], dtype=np.float64)
+                center[2] += dz
+                rows[6] = [center.tolist(), *rows[6][1:]]
+            payload["data"] = rows
+            cs[payload_key] = payload
+        if isinstance(cs.get("pose_payload"), dict):
+            cs["pose_data"] = cs["pose_payload"].get("data")
+        if isinstance(cs.get("bip22_payload"), dict):
+            cs["bip22_pose_data"] = cs["bip22_payload"].get("data")
+        if isinstance(cs.get("points_53_tsv"), str):
+            lines = cs["points_53_tsv"].splitlines()
+            if lines:
+                headers = lines[0].split("\t")
+                try:
+                    key_i, z_i = headers.index("source_key"), headers.index("z")
+                    for i in range(1, len(lines)):
+                        cols = lines[i].split("\t")
+                        if z_i < len(cols) and cols[key_i].strip().lower() != "root" and cols[z_i].strip():
+                            cols[z_i] = f"{float(cols[z_i]) + dz * 100.0:.6f}"
+                            lines[i] = "\t".join(cols)
+                    cs["points_53_tsv"] = "\n".join(lines) + "\n"
+                except (ValueError, IndexError):
+                    pass
+        points = cs.get("points_53")
+        if isinstance(points, list):
+            shifted_points = []
+            for point in points:
+                if not isinstance(point, dict):
+                    shifted_points.append(point)
+                    continue
+                item = dict(point)
+                if all(isinstance(item.get(key), (int, float)) for key in ("x", "y", "z")):
+                    item["z"] = 0.0 if str(item.get("source_key") or "").strip().lower() == "root" else item["z"] + dz * 100.0
+                shifted_points.append(item)
+            cs["points_53"] = shifted_points
+        body["cs"] = cs
+        for key in ("bip22_joints", "bip22_facing", "bip22_conf", "bip22_source", "bip22_height_m"):
+            if key in cs:
+                body[key] = cs[key]
+    original_body.update(body)
+    report = {"status": "applied", "angle_deg": round(angle_deg, 6), "dz_m": round(dz, 6), "source": floor_source}
+    return report
 
 
 def landing_shift(
