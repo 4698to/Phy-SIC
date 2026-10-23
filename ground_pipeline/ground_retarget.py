@@ -22,6 +22,7 @@ import math
 import os
 import re
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -69,6 +70,11 @@ MHR70_FALLBACK: Dict[str, int] = {
 MHR70_COCO17 = tuple(MHR70_FALLBACK[name] for name in COCO17)
 
 DEFAULT_KEYPOINT_SCORE = 0.92
+
+# MHR127 中骨盆（SMPL24 的 0 号关节）索引，用作 generic_pose 的对齐支点
+MHR_PELVIS_INDEX = 0
+# generic 骨盆与主骨架支点的最大允许偏差（米），超出时回退主支点并告警
+GENERIC_PIVOT_TOLERANCE_M = 0.15
 
 # 默认 Biped 目标（assets/biped_rest_profile.v1.json，66 骨静态参考）
 DEFAULT_HIPS_BONE = "Bip001 Pelvis"
@@ -534,239 +540,6 @@ def _transform_retarget(payload: Dict[str, Any], q: np.ndarray, offset: np.ndarr
     return out
 
 
-def _transform_cs_block(
-    cs_block: Optional[Dict[str, Any]],
-    *,
-    q: np.ndarray,
-    offset: np.ndarray,
-    bip22_world,
-) -> Optional[Dict[str, Any]]:
-    """``cs`` 载荷（Figure 系，厘米）-> ``ground_world_v1``（厘米）。
-
-    三处来源不同：
-
-    - ``pose_payload.data[0]`` 前 22 行与 ``bip22_payload.data[0]`` 是 L5 对齐后的
-      bip22 骨架，直接用世界系 ``world.bip22_joints``（米）覆盖；``pose_payload``
-      第 22 行起的躯干派生点、``points_53`` 与相机中心是 figure 绝对坐标，做
-      换基 + ``offset``；
-    - 方向类字段（头轴、足法线、胸向右、手指轴、``bip22_facing``）只换基不平移；
-    - 相机中心在 ``data[6][0]`` 里是 figure **米**，其余槽位不受影响。
-    """
-    if not isinstance(cs_block, dict):
-        return cs_block
-    offset_cm = offset * 100.0
-    world_positions = (
-        np.asarray(bip22_world, dtype=np.float64).reshape(-1, 3)
-        if bip22_world is not None and len(bip22_world)
-        else None
-    )
-    world_rows = None if world_positions is None else world_positions * 100.0
-
-    def _point(row) -> List[float]:
-        return (q @ np.asarray(row, dtype=np.float64).reshape(3) + offset_cm).tolist()
-
-    def _direction(row) -> List[float]:
-        return (q @ np.asarray(row, dtype=np.float64).reshape(3)).tolist()
-
-    def _directions(rows) -> List[Any]:
-        return [None if row is None else _direction(row) for row in (rows or [])]
-
-    def _points53_tsv(tsv: Any) -> Any:
-        """``points_53_tsv``（figure 系厘米）逐行改写为世界系厘米。
-
-        ``root`` 是骨盆 xy 在 z=0 地面上的投影，世界系同样取 ``world_rows[0]``
-        的 xy、z 置 0；缺失点（xyz 全 0）保持原样。
-        """
-        if not isinstance(tsv, str) or not tsv.strip():
-            return tsv
-        lines = [line for line in tsv.replace("\r\n", "\n").split("\n") if line.strip()]
-        if not lines:
-            return tsv
-        headers = lines[0].split("\t")
-        try:
-            key_col = headers.index("source_key")
-            vec_cols = (headers.index("x"), headers.index("y"), headers.index("z"))
-        except ValueError:
-            return tsv
-        rewritten = [lines[0]]
-        for line in lines[1:]:
-            cols = line.split("\t")
-            if key_col >= len(cols) or max(vec_cols) >= len(cols):
-                rewritten.append(line)
-                continue
-            try:
-                xyz = [float(cols[i]) for i in vec_cols]
-            except ValueError:
-                rewritten.append(line)
-                continue
-            if not any(xyz):
-                rewritten.append(line)
-                continue
-            if cols[key_col].strip().lower() == "root" and world_rows is not None:
-                xyz = [world_rows[0][0], world_rows[0][1], 0.0]
-            else:
-                xyz = _point(xyz)
-            for col, value in zip(vec_cols, xyz):
-                cols[col] = f"{float(value):.6f}"
-            rewritten.append("\t".join(cols))
-        return "\n".join(rewritten) + "\n"
-
-    def _skeleton(rows) -> List[Any]:
-        """L5 对齐的骨架：前 22 行用世界系值，超出部分按绝对坐标换基。"""
-        out: List[Any] = []
-        for index, row in enumerate(rows or []):
-            if row is None:
-                out.append(None)
-            elif world_rows is not None and index < len(world_rows):
-                out.append(world_rows[index].tolist())
-            else:
-                out.append(_point(row))
-        return out
-
-    def _pose_payload(payload: Any) -> Any:
-        if not isinstance(payload, dict):
-            return payload
-        data = payload.get("data")
-        if not isinstance(data, list) or not data:
-            return payload
-        rows = list(data)
-        if isinstance(rows[0], list):
-            rows[0] = _skeleton(rows[0])
-        if len(rows) > 1:
-            rows[1] = _directions(rows[1])
-        if len(rows) > 2:
-            rows[2] = _directions(rows[2])
-        if len(rows) > 3 and rows[3] is not None:
-            rows[3] = _direction(rows[3])
-        if len(rows) > 5 and isinstance(rows[5], list):
-            rows[5] = [
-                None if hand is None else [_direction(axis) for axis in hand]
-                for hand in rows[5]
-            ]
-        if len(rows) > 6 and isinstance(rows[6], list) and rows[6] and rows[6][0] is not None:
-            camera = list(rows[6])
-            center = np.asarray(camera[0], dtype=np.float64).reshape(3)
-            camera[0] = ((q @ center + offset) * 100.0).tolist()
-            rows[6] = camera
-        updated = dict(payload)
-        updated["data"] = rows
-        updated["frame"] = FRAME_WORLD
-        updated["unit"] = "centimeter"
-        return updated
-
-    def _bip22_payload(payload: Any) -> Any:
-        if not isinstance(payload, dict):
-            return payload
-        data = payload.get("data")
-        if not isinstance(data, list) or not data:
-            return payload
-        rows = list(data)
-        positions = rows[0]
-        if isinstance(positions, list) and positions:
-            if world_rows is not None:
-                rows[0] = world_rows[: len(positions)].tolist()
-            else:
-                rows[0] = [_point(row) for row in positions]
-        updated = dict(payload)
-        updated["data"] = rows
-        updated["frame"] = FRAME_WORLD
-        updated["unit"] = "centimeter"
-        return updated
-
-    out = dict(cs_block)
-    out["frame"] = FRAME_WORLD
-    out["unit"] = "centimeter"
-    pose_payload = _pose_payload(cs_block.get("pose_payload"))
-    out["pose_payload"] = pose_payload
-    if isinstance(pose_payload, dict):
-        out["pose_data"] = pose_payload.get("data")
-    bip22_payload = _bip22_payload(cs_block.get("bip22_payload"))
-    out["bip22_payload"] = bip22_payload
-    if isinstance(bip22_payload, dict):
-        out["bip22_pose_data"] = bip22_payload.get("data")
-    if world_positions is not None:
-        out["bip22_joints"] = world_positions.tolist()
-    facing = cs_block.get("bip22_facing")
-    if isinstance(facing, (list, tuple)) and len(facing) == 3:
-        out["bip22_facing"] = _direction(facing)
-
-    if "points_53_tsv" in out:
-        out["points_53_tsv"] = _points53_tsv(out["points_53_tsv"])
-    points = out.get("points_53")
-    if isinstance(points, list):
-        converted: List[Any] = []
-        for point in points:
-            if not isinstance(point, dict):
-                converted.append(point)
-                continue
-            item = dict(point)
-            x, y, z = point.get("x"), point.get("y"), point.get("z")
-            missing = not all(isinstance(v, (int, float)) for v in (x, y, z)) or not (
-                x or y or z
-            )
-            if missing:
-                converted.append(item)
-                continue
-            if str(point.get("source_key") or "").strip().lower() == "root" and world_rows is not None:
-                item["x"], item["y"], item["z"] = (
-                    float(world_rows[0][0]),
-                    float(world_rows[0][1]),
-                    0.0,
-                )
-            else:
-                item["x"], item["y"], item["z"] = _point([x, y, z])
-            converted.append(item)
-        out["points_53"] = converted
-    return out
-
-
-def apply_world_frames(
-    body: Dict[str, Any],
-    world: Optional[Dict[str, Any]],
-    transform: Optional[GroundTransform],
-    pred_cam_t=None,
-) -> None:
-    """把返回给客户端的骨骼字段统一替换为 ``ground_world_v1`` 数值（原地修改）。
-
-    ``world`` 不可用时保持 figure 系原值，``joints_3d_frame`` 等标签仍如实描述。
-    """
-    if not isinstance(world, dict) or world.get("status") != "ok" or transform is None:
-        return
-    cam_t = (
-        np.zeros(3, dtype=np.float64)
-        if pred_cam_t is None
-        else np.asarray(pred_cam_t, dtype=np.float64).reshape(3)
-    )
-    q = transform.rotation @ FIGURE_P.T
-    offset = transform.rotation @ cam_t + transform.translation
-
-    joints = world.get("joints_3d")
-    if isinstance(joints, list) and joints:
-        body["joints_3d"] = joints
-        body["joints_3d_frame"] = FRAME_WORLD
-    keypoints = world.get("keypoints_3d_coco17")
-    if isinstance(keypoints, list) and keypoints:
-        body["keypoints_3d_coco17"] = keypoints
-        body["keypoints_3d_coco17_frame"] = FRAME_WORLD
-    if isinstance(world.get("retarget"), dict):
-        body["retarget"] = world["retarget"]
-    if isinstance(world.get("generic_pose"), dict):
-        body["generic_pose"] = world["generic_pose"]
-
-    cs = _transform_cs_block(
-        body.get("cs"),
-        q=q,
-        offset=offset,
-        bip22_world=world.get("bip22_joints"),
-    )
-    if isinstance(cs, dict):
-        body["cs"] = cs
-        if isinstance(cs.get("bip22_joints"), list):
-            body["bip22_joints"] = cs["bip22_joints"]
-        if cs.get("bip22_facing") is not None:
-            body["bip22_facing"] = cs["bip22_facing"]
-
-
 _BIP22_SMPL_SOURCE = re.compile(r"^SMPL\[(\d+)\]$")
 
 
@@ -797,8 +570,20 @@ def _bip22_anchor(joints_fig, bip22_joints, sources) -> Optional[np.ndarray]:
 
 def alignment_rotation(transform: GroundTransform) -> Tuple[np.ndarray, float]:
     """Return the proper rotation that maps figure-space ground-up onto +Z."""
-    up = FIGURE_P @ np.asarray(transform.rotation, dtype=np.float64).T @ np.array([0.0, 0.0, 1.0])
-    up /= np.linalg.norm(up)
+    camera_to_world = np.asarray(transform.rotation, dtype=np.float64).reshape(3, 3)
+    if not np.isfinite(camera_to_world).all():
+        raise ValueError("ground rotation contains non-finite values")
+    if not np.allclose(camera_to_world @ camera_to_world.T, np.eye(3), atol=1e-6):
+        raise ValueError("ground rotation is not orthonormal")
+    if abs(np.linalg.det(camera_to_world) - 1.0) > 1e-6:
+        raise ValueError("ground rotation is not a proper rotation")
+
+    up = FIGURE_P @ camera_to_world.T @ np.array([0.0, 0.0, 1.0])
+    norm = float(np.linalg.norm(up))
+    if not math.isfinite(norm) or norm < 1e-9:
+        raise ValueError("ground up vector is degenerate")
+    up = up / norm
+
     cosine = float(np.clip(up[2], -1.0, 1.0))
     angle = math.acos(cosine)
     if cosine < -0.999999:
@@ -806,12 +591,17 @@ def alignment_rotation(transform: GroundTransform) -> Tuple[np.ndarray, float]:
     if angle < 1e-12:
         return np.eye(3, dtype=np.float64), 0.0
     axis = np.cross(up, np.array([0.0, 0.0, 1.0]))
-    axis /= np.linalg.norm(axis)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm < 1e-9:
+        raise ValueError("ground up rotation axis is degenerate")
+    axis /= axis_norm
     skew = np.array(
         [[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]],
         dtype=np.float64,
     )
     rotation = np.eye(3) + math.sin(angle) * skew + (1.0 - math.cos(angle)) * (skew @ skew)
+    if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6) or abs(np.linalg.det(rotation) - 1.0) > 1e-6:
+        raise ValueError("gravity alignment rotation is not a proper rotation")
     return rotation, math.degrees(angle)
 
 
@@ -819,11 +609,14 @@ def apply_gravity_alignment(
     body: Dict[str, Any],
     transform: GroundTransform,
     *,
-    pred_cam_t=None,
     mesh_vertices=None,
 ) -> Dict[str, Any]:
     """Align all consumer pose values to figure +Z, then place the selected geometry on z=0."""
-    from ai_vitpose.core.generic_pose import _euler_zyx_to_rotmat, _rotmat_to_euler_zyx
+    existing = body.get("gravity_alignment")
+    if body.get("gravity_aligned") is True or (
+        isinstance(existing, dict) and existing.get("applied") is True
+    ):
+        raise ValueError("gravity alignment already applied")
 
     original_body = body
     body = copy.deepcopy(body)
@@ -832,10 +625,11 @@ def apply_gravity_alignment(
     if not len(joints):
         raise ValueError("pose has no joints for gravity alignment pivot")
     pivot = joints[0].copy()
+    warnings = body.setdefault("warnings", [])
 
-    def align_points(points, origin, scale=1.0):
+    def align_points(points, origin):
         arr = np.asarray(points, dtype=np.float64)
-        return ((arr - origin) @ rotation.T + origin).reshape(arr.shape) * scale
+        return ((arr - origin) @ rotation.T + origin).reshape(arr.shape)
 
     joints = align_points(joints, pivot)
     body["joints_3d"] = joints.tolist()
@@ -851,7 +645,15 @@ def apply_gravity_alignment(
     if isinstance(generic, dict):
         generic = dict(generic)
         generic_points = np.asarray(generic.get("pred_joint_coords", [pivot]), dtype=np.float64).reshape(-1, 3)
-        generic_pivot = generic_points[1].copy() if len(generic_points) > 1 else pivot
+        if len(generic_points) > MHR_PELVIS_INDEX:
+            generic_pivot = generic_points[MHR_PELVIS_INDEX].copy()
+            if float(np.linalg.norm(generic_pivot - pivot)) > GENERIC_PIVOT_TOLERANCE_M:
+                warnings.append(
+                    "generic pelvis deviates from main skeleton pivot; using main pivot"
+                )
+                generic_pivot = pivot
+        else:
+            generic_pivot = pivot
         for key in ("pred_joint_coords", "pred_keypoints_3d"):
             if generic.get(key) is not None:
                 generic[key] = align_points(generic[key], generic_pivot).tolist()
@@ -861,6 +663,8 @@ def apply_gravity_alignment(
                  for m in generic["pred_global_rots"]]
             ).tolist()
         if generic.get("global_rot") is not None:
+            from ai_vitpose.core.generic_pose import _euler_zyx_to_rotmat, _rotmat_to_euler_zyx
+
             old = _euler_zyx_to_rotmat(np.asarray(generic["global_rot"], dtype=np.float64).reshape(3))
             generic["global_rot"] = _rotmat_to_euler_zyx(rotation @ old).tolist()
         generic["frame"] = FRAME_FIGURE
@@ -897,10 +701,16 @@ def apply_gravity_alignment(
     cs = body.get("cs")
     cs = dict(cs) if isinstance(cs, dict) else None
     if cs is not None:
-        pelvis_cm = np.asarray(cs.get("bip22_joints", [])[1], dtype=np.float64) if len(cs.get("bip22_joints", [])) > 1 else pivot * 100.0
+        # cs.bip22_joints 与顶层同为米；pose_payload / points_53 为厘米
+        bip_meta = cs.get("bip22_joints")
+        pelvis_m = (
+            np.asarray(bip_meta[1], dtype=np.float64)
+            if isinstance(bip_meta, list) and len(bip_meta) > 1
+            else pivot.copy()
+        )
 
         def cs_point(point):
-            return (rotation @ (np.asarray(point, dtype=np.float64).reshape(3) / 100.0 - pelvis_cm / 100.0) + pelvis_cm / 100.0) * 100.0
+            return (rotation @ (np.asarray(point, dtype=np.float64).reshape(3) / 100.0 - pelvis_m) + pelvis_m) * 100.0
 
         def cs_direction(vector):
             return (rotation @ np.asarray(vector, dtype=np.float64).reshape(3)).tolist()
@@ -909,11 +719,11 @@ def apply_gravity_alignment(
         aligned_bip = None
         if isinstance(bip, list) and bip:
             aligned_bip = np.asarray(bip, dtype=np.float64).reshape(-1, 3)
-            aligned_bip = (aligned_bip / 100.0 - pelvis_cm / 100.0) @ rotation.T * 100.0 + pelvis_cm
+            aligned_bip = (aligned_bip - pelvis_m) @ rotation.T + pelvis_m
             if len(aligned_bip) > 1:
                 aligned_bip[0] = [aligned_bip[1, 0], aligned_bip[1, 1], 0.0]
             cs["bip22_joints"] = aligned_bip.tolist()
-        pelvis_xy_cm = aligned_bip[1, :2].copy() if aligned_bip is not None and len(aligned_bip) > 1 else None
+        pelvis_xy_cm = aligned_bip[1, :2] * 100.0 if aligned_bip is not None and len(aligned_bip) > 1 else None
         for payload_key in ("pose_payload", "bip22_payload"):
             payload = cs.get(payload_key)
             if not isinstance(payload, dict) or not isinstance(payload.get("data"), list) or not payload["data"]:
@@ -922,7 +732,7 @@ def apply_gravity_alignment(
             rows = list(payload["data"])
             if isinstance(rows[0], list):
                 values = np.asarray(rows[0], dtype=np.float64).reshape(-1, 3)
-                values = (values / 100.0 - pelvis_cm / 100.0) @ rotation.T * 100.0 + pelvis_cm
+                values = (values / 100.0 - pelvis_m) @ rotation.T * 100.0 + pelvis_m * 100.0
                 if len(values) > 1:
                     values[0] = [values[1, 0], values[1, 1], 0.0]
                 rows[0] = values.tolist()
@@ -997,8 +807,8 @@ def apply_gravity_alignment(
 
     points_for_floor = []
     if mesh_vertices is not None:
-        cam_t = np.zeros(3, dtype=np.float64) if pred_cam_t is None else np.asarray(pred_cam_t, dtype=np.float64).reshape(3)
-        mesh_fig = (np.asarray(mesh_vertices, dtype=np.float64).reshape(-1, 3) + cam_t) @ FIGURE_P.T
+        # 顶点与 joints/keypoints 同在未平移的模型系，采样不再叠加 pred_cam_t
+        mesh_fig = np.asarray(mesh_vertices, dtype=np.float64).reshape(-1, 3) @ FIGURE_P.T
         points_for_floor.append((mesh_fig - pivot) @ rotation.T + pivot)
         floor_source = "sam3d_mesh"
     else:
@@ -1035,7 +845,7 @@ def apply_gravity_alignment(
         cs = dict(cs)
         if isinstance(cs.get("bip22_joints"), list):
             bip = np.asarray(cs["bip22_joints"], dtype=np.float64).reshape(-1, 3)
-            bip[:, 2] += dz * 100.0
+            bip[:, 2] += dz
             if len(bip):
                 bip[0, 2] = 0.0
             cs["bip22_joints"] = bip.tolist()
@@ -1092,8 +902,127 @@ def apply_gravity_alignment(
             if key in cs:
                 body[key] = cs[key]
     original_body.update(body)
-    report = {"status": "applied", "angle_deg": round(angle_deg, 6), "dz_m": round(dz, 6), "source": floor_source}
+    report = {
+        "status": "applied",
+        "applied": True,
+        "angle_deg": round(angle_deg, 6),
+        "dz_m": round(dz, 6),
+        "source": floor_source,
+        "pivot": pivot.tolist(),
+    }
     return report
+
+
+def resolve_gravity_alignment(
+    body: Dict[str, Any],
+    transform: Optional[GroundTransform],
+    *,
+    align: bool,
+    ground_status: str = "ok",
+    ground_error: Optional[str] = None,
+    mesh_vertices=None,
+) -> Dict[str, Any]:
+    """服务端重力对齐策略：执行/跳过对齐，并统一写入 body 元数据。
+
+    ``status`` 枚举：``applied`` / ``skipped``（``reason=disabled``）/
+    ``ground_unavailable`` / ``ground_error`` / ``invalid_direction`` / ``error``。
+    """
+    if align and transform is not None:
+        try:
+            report = apply_gravity_alignment(body, transform, mesh_vertices=mesh_vertices)
+            body["gravity_aligned"] = True
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            message = str(exc)
+            invalid = any(
+                token in message
+                for token in ("degenerate", "opposite", "not orthonormal", "not a proper rotation")
+            )
+            status = "invalid_direction" if invalid else "error"
+            report = {
+                "status": status,
+                "applied": False,
+                "source": "none",
+                "reason": status,
+                "error": message,
+            }
+            body["gravity_aligned"] = False
+            body.setdefault("warnings", []).append(f"gravity alignment unavailable: {message}")
+    elif align:
+        status = "ground_error" if ground_status == "error" else "ground_unavailable"
+        report = {
+            "status": status,
+            "applied": False,
+            "source": "none",
+            "reason": status,
+            "error": ground_error,
+        }
+        body.setdefault("warnings", []).append(
+            f"gravity alignment unavailable: {ground_error or 'ground transform unavailable'}"
+        )
+        body["gravity_aligned"] = False
+    else:
+        report = {
+            "status": "skipped",
+            "applied": False,
+            "source": "ground" if transform is not None else "none",
+            "reason": "disabled",
+            "error": None,
+        }
+        if transform is not None:
+            try:
+                _, angle_deg = alignment_rotation(transform)
+            except (ValueError, np.linalg.LinAlgError):
+                angle_deg = None
+            report["angle_deg"] = angle_deg
+        body["gravity_aligned"] = False
+
+    finite_angle = report.get("angle_deg")
+    if finite_angle is not None:
+        try:
+            finite_angle = float(finite_angle)
+        except (TypeError, ValueError):
+            finite_angle = None
+        if finite_angle is not None and not math.isfinite(finite_angle):
+            finite_angle = None
+    report["angle_deg"] = finite_angle
+    body["align_angle_deg"] = finite_angle
+    body["gravity_alignment"] = report
+    for key in ("cs", "retarget"):
+        block = body.get(key)
+        if isinstance(block, dict):
+            block["gravity_aligned"] = body["gravity_aligned"]
+            block["align_angle_deg"] = finite_angle
+    cs = body.get("cs")
+    if isinstance(cs, dict):
+        payload = cs.get("pose_payload")
+        if isinstance(payload, dict):
+            payload["gravity_aligned"] = body["gravity_aligned"]
+            payload["align_angle_deg"] = finite_angle
+    return report
+
+
+def insert_gravity_xml_metadata(content: bytes, body: Dict[str, Any]) -> bytes:
+    """把 ``body`` 的重力对齐元数据写入 poseResult/csPose/targetPose 三个节点属性。"""
+    root = ET.fromstring(content)
+    aligned = "true" if body.get("gravity_aligned") else "false"
+    angle = body.get("align_angle_deg")
+    angle_text: Optional[str] = None
+    if angle is not None:
+        try:
+            angle_value = float(angle)
+        except (TypeError, ValueError):
+            angle_value = None
+        if angle_value is not None and math.isfinite(angle_value):
+            angle_text = f"{angle_value:.6f}"
+    for element in root.iter():
+        if element.tag not in ("poseResult", "csPose", "targetPose"):
+            continue
+        element.set("gravity_aligned", aligned)
+        if angle_text is None:
+            element.attrib.pop("align_angle_deg", None)
+        else:
+            element.set("align_angle_deg", angle_text)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 def landing_shift(

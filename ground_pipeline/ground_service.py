@@ -38,11 +38,12 @@ from ground_pipeline.ground_retarget import (
     GroundTransform,
     RetargetAdapter,
     RetargetError,
-    apply_gravity_alignment,
     build_world_block,
+    insert_gravity_xml_metadata,
     insert_world_xml,
     landing_shift,
     parse_ground_request,
+    resolve_gravity_alignment,
     skipped_world,
 )
 
@@ -150,6 +151,17 @@ def _npy_b64(arr: np.ndarray) -> str:
     buf = io.BytesIO()
     np.save(buf, np.asarray(arr, dtype=np.float32))
     return base64.b64encode(buf.getvalue()).decode()
+
+
+def _pose_vitpose_bbox(rgb: np.ndarray) -> Optional[np.ndarray]:
+    """无地面时按参考实现用 ViTPose 关键点框；ViTPose 不可用则返回 None（回退人物 mask 框）。"""
+    try:
+        from ai_vitpose.core import vitpose_detector
+
+        return vitpose_detector.vitpose_bbox(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    except Exception as exc:  # noqa: BLE001 - ViTPose 可选，缺失时不影响姿势推理
+        logger.warning("ViTPose bbox 不可用，SAM3D 使用人物 mask 框: %s", exc)
+        return None
 
 
 def _person_mask(segmenter, image_pil, person_prompt: str) -> Optional[np.ndarray]:
@@ -1925,12 +1937,15 @@ def _pose_resolve_world(
 
 
 def _pose_camera_space_block(
-    state: Dict[str, Any], raw: Dict[str, Any], keypoints_3d_coco17: Any
+    state: Dict[str, Any], raw: Dict[str, Any], keypoints_3d_cam: Any
 ) -> Optional[Dict[str, Any]]:
     """无可靠地面时的回退：只输出相机锚定（camera_v1）的 SAM-3D 数据。
 
     顶点与关键点都在 SAM-3D 模型系，统一加 ``pred_cam_t`` 换到相机系
     （与 ``build_world_block`` 里 ``+cam_t`` 的处理一致）。
+    关键点必须传相机/模型系快照（``internal["keypoints_3d_cam"]``），不能传
+    顶层 ``keypoints_3d_coco17``——后者是 ``figure_v6``（重力对齐后还会再被旋转、
+    落地），再叠加 ``pred_cam_t`` 会得到错误坐标系。
     全程不做地面平面换基、不做落地平移。
     """
     vertices = raw.get("pred_vertices")
@@ -1942,8 +1957,8 @@ def _pose_camera_space_block(
         return None
     cam_t_arr = np.asarray(cam_t, dtype=np.float64).reshape(3)
     kp = (
-        np.asarray(keypoints_3d_coco17, dtype=np.float64).reshape(-1, 3) + cam_t_arr.reshape(1, 3)
-        if keypoints_3d_coco17 is not None
+        np.asarray(keypoints_3d_cam, dtype=np.float64).reshape(-1, 3) + cam_t_arr.reshape(1, 3)
+        if keypoints_3d_cam is not None
         else np.zeros((0, 3))
     )
     faces = getattr(getattr(state.get("pose_estimator"), "estimator", None), "faces", None)
@@ -2101,6 +2116,36 @@ def _pose_single_pipeline(
             logger.warning("人物分割失败，改用整图 bbox: %s", exc)
         if person_mask is None or not np.asarray(person_mask).any():
             person_mask = np.ones(rgb.shape[:2], dtype=bool)
+            bbox_source = "full_image"
+        else:
+            bbox_source = "mask"
+
+        ground_transform: Optional[GroundTransform] = None
+        ground_status = "skipped"
+        ground_error: Optional[str] = None
+        landing: Optional[Dict[str, Any]] = None
+        world_raw = None
+        run_ground = want_world or align_gravity
+        if run_ground:
+            try:
+                ground_transform, ground_status, ground_error = _pose_resolve_ground(
+                    state,
+                    data=data,
+                    ground_mode=ground_mode,
+                    rgb=rgb,
+                    default_floor_prompt=state.get("floor_prompt") or DEFAULT_FLOOR_PROMPT,
+                )
+            except RetargetError as exc:
+                if want_world:
+                    return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+                ground_status, ground_error = "error", str(exc)
+
+        # bbox 决策：地面可用 -> mask 框；地面不可用 -> ViTPose 框（不可用再回退 mask/整图）
+        pose_bbox = None
+        if ground_transform is None:
+            pose_bbox = _pose_vitpose_bbox(rgb)
+            if pose_bbox is not None:
+                bbox_source = "vitpose"
 
         try:
             pose = estimator.infer(
@@ -2110,6 +2155,7 @@ def _pose_single_pipeline(
                 want_mesh=False,
                 cam_int=None,
                 include_raw=True,
+                bbox=pose_bbox[0] if pose_bbox is not None else None,
             )
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
@@ -2128,30 +2174,11 @@ def _pose_single_pipeline(
             return 200, _pose_cancelled_body(rid)
 
         raw = pose.get("raw") or {}
-        # 落地：直接平移 SAM-3D 源数据，保证下游派生姿势与世界系可视化同高
-        ground_transform: Optional[GroundTransform] = None
-        ground_status = "skipped"
-        ground_error: Optional[str] = None
-        landing: Optional[Dict[str, Any]] = None
         world_raw = raw
-        run_ground = want_world or align_gravity
-        if run_ground:
-            try:
-                ground_transform, ground_status, ground_error = _pose_resolve_ground(
-                    state,
-                    data=data,
-                    ground_mode=ground_mode,
-                    rgb=rgb,
-                    default_floor_prompt=state.get("floor_prompt") or DEFAULT_FLOOR_PROMPT,
-                )
-            except RetargetError as exc:
-                if want_world:
-                    return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
-                ground_status, ground_error = "error", str(exc)
-            if ground_transform is not None:
-                landing_state = _pose_apply_landing(ground_transform, raw)
-                landing = landing_state["report"]
-                world_raw = landing_state["raw"]
+        if ground_transform is not None:
+            landing_state = _pose_apply_landing(ground_transform, raw)
+            landing = landing_state["report"]
+            world_raw = landing_state["raw"]
 
         try:
             body, internal = adapter.assemble_pose(
@@ -2217,58 +2244,19 @@ def _pose_single_pipeline(
                 world = skipped_world(ground_status, ground_mode=ground_mode, error=ground_error)
             body["world"] = world
 
-        alignment_report: Dict[str, Any]
-        if align_gravity and ground_transform is not None:
-            try:
-                alignment_report = apply_gravity_alignment(
-                    body,
-                    ground_transform,
-                    pred_cam_t=internal.get("pred_cam_t"),
-                    mesh_vertices=raw.get("pred_vertices"),
-                )
-                body["gravity_aligned"] = True
-            except (ValueError, np.linalg.LinAlgError) as exc:
-                alignment_report = {"status": "error", "source": "none", "error": str(exc)}
-                body["gravity_aligned"] = False
-                body.setdefault("warnings", []).append(f"gravity alignment skipped: {exc}")
-        else:
-            alignment_report = {
-                "status": "skipped" if not align_gravity else ground_status,
-                "source": "none",
-                "error": ground_error if align_gravity else None,
-            }
-            body["gravity_aligned"] = False
-            if align_gravity:
-                body.setdefault("warnings", []).append(
-                    f"gravity alignment unavailable: {ground_error or 'ground transform unavailable'}"
-                )
-        finite_angle = alignment_report.get("angle_deg")
-        if finite_angle is not None:
-            try:
-                finite_angle = float(finite_angle)
-            except (TypeError, ValueError):
-                finite_angle = None
-            if finite_angle is not None and not math.isfinite(finite_angle):
-                finite_angle = None
-        alignment_report["angle_deg"] = finite_angle
-        body["align_angle_deg"] = finite_angle
-        body["gravity_alignment"] = alignment_report
-        cs_output = body.get("cs")
-        if isinstance(cs_output, dict):
-            cs_output["gravity_aligned"] = body["gravity_aligned"]
-            cs_output["align_angle_deg"] = finite_angle
-            pose_payload = cs_output.get("pose_payload")
-            if isinstance(pose_payload, dict):
-                pose_payload["gravity_aligned"] = body["gravity_aligned"]
-                pose_payload["align_angle_deg"] = finite_angle
-        retarget_output = body.get("retarget")
-        if isinstance(retarget_output, dict):
-            retarget_output["gravity_aligned"] = body["gravity_aligned"]
-            retarget_output["align_angle_deg"] = finite_angle
+        resolve_gravity_alignment(
+            body,
+            ground_transform,
+            align=align_gravity,
+            ground_status=ground_status,
+            ground_error=ground_error,
+            mesh_vertices=raw.get("pred_vertices"),
+        )
+        body["bbox_source"] = bbox_source
 
         # 无可靠世界系（want_world=false 或地面推理失败）时，额外给出相机锚定回退块
         if want_mesh and (world is None or world.get("status") != "ok"):
-            cam_block = _pose_camera_space_block(state, raw, body.get("keypoints_3d_coco17"))
+            cam_block = _pose_camera_space_block(state, raw, internal.get("keypoints_3d_cam"))
             if cam_block is not None:
                 body["camera_space"] = cam_block
 
@@ -2893,19 +2881,7 @@ def create_ground_app(
             if v2 and serializer is not None:
                 content, media = serializer.serialize_v2_response(body, response_format=fmt)
                 if fmt == "xml":
-                    xml_root = ET.fromstring(content)
-                    aligned = "true" if body.get("gravity_aligned") else "false"
-                    angle = body.get("align_angle_deg")
-                    angle_text = "" if angle is None else f"{float(angle):.6f}"
-                    for element in [xml_root, *list(xml_root)]:
-                        if element.tag not in ("poseResult", "csPose", "targetPose"):
-                            continue
-                        element.set("gravity_aligned", aligned)
-                        element.set("align_angle_deg", angle_text)
-                        if element.tag == "poseResult":
-                            ET.SubElement(element, "gravity_aligned").text = aligned
-                            ET.SubElement(element, "align_angle_deg").text = angle_text
-                    content = ET.tostring(xml_root, encoding="utf-8", xml_declaration=True)
+                    content = insert_gravity_xml_metadata(content, body)
                 if fmt == "xml" and isinstance(body.get("world"), dict):
                     content = insert_world_xml(content.decode("utf-8"), body["world"]).encode("utf-8")
                     media = "application/xml; charset=utf-8"

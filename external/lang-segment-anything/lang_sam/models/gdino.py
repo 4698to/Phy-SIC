@@ -1,3 +1,5 @@
+import inspect
+
 import torch
 from PIL import Image
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
@@ -37,12 +39,17 @@ class GDINO:
         with torch.no_grad():
             outputs = self.model(**inputs)
 
+        post_kwargs = {
+            "text_threshold": text_threshold,
+            "target_sizes": [k.size[::-1] for k in pil_images],
+        }
+        # transformers>=4.51 把 box_threshold 改名为 threshold
+        parameters = inspect.signature(self.processor.post_process_grounded_object_detection).parameters
+        post_kwargs["threshold" if "threshold" in parameters else "box_threshold"] = box_threshold
         results = self.processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-            target_sizes=[k.size[::-1] for k in pil_images],
+            **post_kwargs,
         )
         return results
 

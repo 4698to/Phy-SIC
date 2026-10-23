@@ -291,7 +291,7 @@ P0 不返回 ViTPose 2D keypoints/confidence，也不把 `joints_3d` 变换到 g
 
 姿势推理**复用同一个 ground 进程**，不与地面接口抢端口：配置 `SAM3D_RESOURCES`（或 `--sam3d-resources`）后，`lifespan` 会在加载 DepthPro/LangSAM 之后额外加载 SAM3D Body ViT-H 与重定向资产（默认端口 8001；本机联调常用 8004）。未配置时地面接口照常工作，只有姿势路由返回 503。
 
-能力对齐 `G:\UGit\QingGeTools\ImagePose_Resources`（SAM3D MHR-127 → SMPL-24 → `generic_pose` → 目标骨架重定向 → CS 载荷），并新增本项目的地面世界系换算 `world`（`ground_world_v1`，+Z 向上、地面 `z=0`）。
+能力对齐 `G:\UGit\QingGeTools\ImagePose_Resources`（SAM3D MHR-127 → SMPL-24 → `generic_pose` → 目标骨架重定向 → CS 载荷），并新增本项目的地面世界系诊断块 `world`（`ground_world_v1`，+Z 向上、地面 `z=0`）与重力对齐 `align_gravity`（把姿势旋到地面 up 方向并落地）。
 
 | 路由 | 内容 |
 |---|---|
@@ -315,9 +315,10 @@ P0 不返回 ViTPose 2D keypoints/confidence，也不把 `joints_3d` 变换到 g
 | `engine` | string | 否 | `sam3d_vitpose` | 仅支持该值；其它值返回 **200 + `status=error`**（与参考实现一致） |
 | `want_overlay` | bool | 否 | `true` | 返回 COCO-17 2D 骨架叠加图（`overlay_jpeg_b64`，**裸 Base64**，无 `data:image` 前缀）；`world.status=ok` 时先叠加检测到的地平面网格 |
 | `want_raw` | bool | 否 | `false` | 返回 SAM3D 原始输出（127 关节、旋转、关键点、`pred_cam_t` 等），字段与参考实现同名 |
-| `want_world` | bool | 否 | **`true`** | 返回地面世界系 `world` 块；地面未就绪时 `world.status=skipped`，其余字段照常 |
+| `want_world` | bool | 否 | **`true`** | 返回地面世界系诊断块 `world`（`ground_world_v1`）；**不改变**顶层姿势数值的坐标系（顶层恒为 `figure_v6`）。地面未就绪时 `world.status=skipped` / `error` |
+| `align_gravity` | bool | 否 | 同 `want_world` | 是否用地面方向做重力对齐并按对齐结果落地；`false` 时不旋转、不落地。未传时回落到 `want_world`（旧客户端兼容）。是否真正推理地面由 `run_ground = want_world \|\| align_gravity` 决定 |
 | `want_mesh` | bool | 否 | `false` | `world.mesh` 返回世界系网格顶点/面（约 1.8 万顶点，体积大，按需开启） |
-| `ground_mode` | string | 否 | `auto` | `auto`=有 `ground` 就用、否则推理；`request`=必须传 `ground`；`infer`=强制推理（未就绪 503）；`none`=不算换世界系 |
+| `ground_mode` | string | 否 | `auto` | 地面来源：`auto`=有 `ground` 就用、否则推理；`request`=必须传 `ground`；`infer`=强制推理（未就绪 503）；`none`=不采用地面变换（注意：它本身不阻止地面推理，需同时令 `want_world=false` 且 `align_gravity=false`） |
 | `ground` | object | 否 | - | `{"plane_normal": [x,y,z], "plane_d": d}`（相机系 `n·p+d=0`）或 `{"rotation": 3×3, "translation": [x,y,z]}`，可把 `/v1/ground` 的返回值直接透传 |
 | `ground_infer_prompts` | object | 否 | 服务默认 | `{"floor_prompt": "floor, wooden floor."}`，仅在需要推理地面时生效 |
 | `retarget_schema` | string | 否 | `auto` | `auto`/`v4`/`v3`/`v1`；`v1` 只返回基础骨架，不做目标骨架重定向 |
@@ -326,7 +327,8 @@ P0 不返回 ViTPose 2D keypoints/confidence，也不把 `joints_3d` 变换到 g
 | `response_format` | string | 否 | `xml`（v2） | `xml` / `json`，仅 v2 生效 |
 
 ```bash
-# 只发图片：默认 want_world=true，自动推理地面并返回地面世界系姿势
+# 只发图片：默认 want_world=true 且 align_gravity 跟随；自动推理地面，
+# 顶层 figure_v6 姿势已按重力对齐并落地，同时返回 world 诊断块
 curl -X POST http://127.0.0.1:8004/v1/pose/single \
   -H "Content-Type: application/json" \
   -d '{"image": "/mnt/g/UGit/Phy-SIC/images/man_exercise2.jpg"}'
@@ -336,6 +338,13 @@ curl -X POST http://127.0.0.1:8004/v1/pose/single \
   -H "Content-Type: application/json" \
   -d '{"image": "data:image/jpeg;base64,...", "want_overlay": false,
        "ground_mode": "request", "ground": {"plane_normal": [0.02, 0.955, 0.296], "plane_d": -1.114}}'
+
+# 不检地面：ViTPose 检人框 + SAM3D 直接推理（相机锚定姿势，不换世界系、不落地）
+# 注意 want_world 默认 true、align_gravity 缺省跟随；必须三者同时显式关闭
+curl -X POST http://127.0.0.1:8004/v1/pose/single \
+  -H "Content-Type: application/json" \
+  -d '{"image": "/mnt/g/UGit/Phy-SIC/images/man_exercise2.jpg",
+       "want_world": false, "align_gravity": false, "ground_mode": "none"}'
 
 # v2 XML 请求（也可用 multipart 上传图片）
 curl -X POST http://127.0.0.1:8004/v2/pose/single \
@@ -351,20 +360,25 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 | `status` | string | `success` / `cancelled` / `error` |
 | `engine` | string | `sam3d_vitpose` |
 | `skeleton_source` | string | `MHR127_direct`（MHR-127 → SMPL-24） |
-| `joints_3d` | number[24][3] | `ground_world_v1` 世界系位置，米；已含落地平移，与 `world.joints_3d` 相同（`world` 不可用时回落 `figure_v6`） |
-| `joints_3d_frame` / `joints_3d_unit` | string | `ground_world_v1` / `meter`（回落时为 `figure_v6` / `meter`） |
+| `joints_3d` | number[24][3] | `figure_v6` 世界朝向位置，米；`align_gravity=true` 且地面有效时已应用重力旋转并按对齐结果落地，否则为未对齐的相机锚定值 |
+| `joints_3d_frame` / `joints_3d_unit` | string | 恒为 `figure_v6` / `meter` |
+| `gravity_aligned` | bool | 本次响应是否已应用重力对齐（`false` 时数值未经地面旋转/落地） |
+| `align_angle_deg` | number \| null | 地面 up 与 Figure +Z 的夹角（诊断值）；地面不可用、方向退化或未启用时为 `null` |
+| `gravity_alignment` | object | 对齐报告：`status`（`applied` / `skipped` / `ground_unavailable` / `ground_error` / `invalid_direction` / `error`）、`applied`、`source`（`sam3d_mesh` / `joints` / `ground` / `none`）、`reason`、`error`、`angle_deg`、`dz_m`、`pivot`。`skipped` 时 `reason=disabled`；失败原因同时以 `warnings` 中的 `gravity alignment unavailable: ...` 暴露 |
+| `bbox_source` | string | SAM3D 输入 bbox 来源：`mask`（人物分割）/ `vitpose`（地面不可用时 ViTPose 检人框）/ `full_image`（分割失败整图） |
 | `confidence` / `valid_joints` | number[24] / int | 关节置信度 |
 | `keypoints_2d_coco17` | number[17][3] | 图像像素坐标 + 分数 |
-| `keypoints_3d_coco17` | number[17][3] | `ground_world_v1` 世界系 3D 关键点，米，与 `world.keypoints_3d_coco17` 相同；`keypoints_3d_coco17_frame` 标注坐标系 |
+| `keypoints_3d_coco17` | number[17][3] | 3D 关键点，米；坐标系以 `keypoints_3d_coco17_frame` 为准（应用重力对齐后为 `figure_v6`，与 `joints_3d` 同源） |
 | `camera` | object | SAM3D 相机估计（内参为模型默认 FOV，非实测标定）；**相机系**，不随骨骼字段换基 |
-| `generic_pose` | object | 参考同构的 127 关节载荷（`pred_joint_coords` / `pred_global_rots` / `global_rot` …），已换基到 `ground_world_v1`（与 `world.generic_pose` 相同） |
-| `bip22_joints` / `bip22_conf` / `bip22_source` / `bip22_height_m` / `bip22_facing` | - | CS 的 22 骨位置，**`ground_world_v1` 世界系、米**（与 `world.bip22_joints` 相同，`[0]` 为落地 root `z=0`）；`bip22_facing` 为世界系方向向量 |
-| `cs` | object | Character Studio 载荷（`pose_payload`、`points_53`、`bip22_payload` …）；标量值 `frame=ground_world_v1`、`unit=centimeter`，前 22 行关节与 `bip22_joints*100` 逐项一致 |
-| `retarget` | object \| null | 目标骨架重定向结果（`schema_version=bip22_pose_v5`，27 骨，`root` + `bones`，每骨 `global_rotation` / `local_rotation` / `position`）；`frame` / `position_space` 为 `ground_world_v1`，`position` 已含落地平移 |
+| `generic_pose` | object | 参考同构的 127 关节载荷（`pred_joint_coords` / `pred_global_rots` / `global_rot` …），与 `joints_3d` 同属 `figure_v6`；重力对齐时位置按骨盆支点旋转、全局旋转左乘 `S` |
+| `bip22_joints` / `bip22_conf` / `bip22_source` / `bip22_height_m` / `bip22_facing` | - | CS 的 22 骨位置，`figure_v6` 系、米，`[0]` 为落地 root（`z=0`）；`bip22_facing` 为同系方向向量 |
+| `cs` | object | Character Studio 载荷（`pose_payload`、`points_53`、`bip22_payload` …），`figure_v6` 系；**块内单位不统一**：`pose_payload` / `bip22_payload` 的位置行、`points_53`、`points_53_tsv` 为**厘米**；`bip22_joints` / `bip22_facing` / `bip22_height_m` 为**米**，与顶层同名字段逐项一致；`pose_payload.data[6]` 为 `[center(米), torso_length(米), fov(度), aspect]`；方向类字段无单位。块本身不带 `frame` / `unit` 字段（与 CS 序列化器一致），单位按字段区分；`gravity_aligned` / `align_angle_deg` 与顶层同值 |
+| `retarget` | object \| null | 目标骨架重定向结果（`schema_version=bip22_pose_v5`，27 骨，`root` + `bones`，每骨 `global_rotation` / `local_rotation` / `position`）；`frame=figure_v6`、`position_space=figure_v6_world`；`gravity_aligned` / `align_angle_deg` 与顶层同值 |
 | `retarget_status` / `retarget_schema` / `retarget_diagnostics` | - | 重定向状态、实际 schema（`auto` 实测解析为 `v4`）、映射诊断 |
 | `target_status` / `target_fingerprint` / `target_diagnostics` | - | `default`（内建 Biped）/ `provided` / `rejected` / `not_provided` |
 | `profile_rest` / `profile_rest_scope` | - | 目标骨架 rest 姿态（`scope=mapped`） |
-| `world` | object | **地面世界系**结果，仅 `want_world=true` 且 `ground_mode!=none`，见下 |
+| `warnings` | string[] | 非致命告警；重力对齐失败/不可用时追加 `gravity alignment unavailable: <原因>`（显式 `align_gravity=false` 不写告警） |
+| `world` | object | **地面世界系诊断块**，仅 `want_world=true`；地面可用时为 `status=ok`，否则为 `skipped` / `error` 占位块。不影响顶层姿势数值 |
 | `camera_space` | object | **相机锚定回退**：`want_mesh=true` 且 `world` 不可用时返回，见下 |
 | `overlay_jpeg_b64` | string | `want_overlay=true` 时的 JPEG **裸 Base64**（失败写 `overlay_error`）；`world.status=ok` 时图中叠加地平面网格，`want_world=false` 或地面 `skipped` 时只有骨架 |
 | `request_id` / `time_ms` | string / number | 任务号与本次耗时 |
@@ -372,7 +386,51 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 
 > 叠加图内容：`world.status=ok` 时先用 `world.rotation` / `world.plane_normal_camera` / `world.plane_d_camera` 与 `camera.focal_px` 把地平面网格投影到图像（橙色细线、55% 混合，网格与世界轴对齐并以世界原点对齐线段），再画 COCO-17 骨架；因此在同一张图里可直接核对骨架是否站在检测到的地面上。网格仅在 `want_world=true`（默认）且地面成功时绘制，`ground_mode=none` 或 `world.status=skipped/error` 时只返回骨架图。
 
-#### `world` 块（地面世界系）
+#### 单位与坐标系约定
+
+服务端不输出「块级 `unit` 就代表块内全部字段」的承诺；单位按字段区分，下表为权威口径。
+
+| 字段 | 坐标系 | 单位 |
+|---|---|---|
+| `joints_3d`、`keypoints_3d_coco17`、`generic_pose` 位置、`retarget.*.position`、`bip22_joints`、`bip22_height_m` | `figure_v6` | 米 |
+| `cs.pose_payload` / `cs.bip22_payload` 的位置行、`cs.points_53`、`cs.points_53_tsv` | `figure_v6` | 厘米 |
+| `cs.pose_payload.data[6][0]`（相机中心）、`cs.pose_payload.data[6][1]`（`torso_length`） | `figure_v6` | 米 |
+| `world.*` 位置、`world.ground_snap.offset_m`、`world.min_z_m`、`camera_space.*` 位置 | `ground_world_v1` / `camera_v1` | 米 |
+| `camera.*`、`camera_space.pred_cam_t` | 相机系 | 米 |
+| 旋转矩阵 / `global_rotation` / `local_rotation`；`bip22_facing`、头轴、足法线、胸向右、手轴等方向向量 | 随所属块 | 无单位（只换基、不平移） |
+| `align_angle_deg`、`gravity_alignment.angle_deg`、`fov` | - | 度 |
+| `bip22_conf`、`aspect`、`confidence` | - | 0~1 / 无量纲 |
+| `keypoints_2d_coco17`、`bbox_2d_xyxy` | 图像 | 像素 |
+
+> `cs` 的厘米语义来自 Character Studio 序列化（`scale_to_max=100`），只适用于位置槽；`cs.bip22_joints` 与顶层同名字段同为米，不要整体乘/除 100。重力对齐时 `cs` 内的米制与厘米制字段用同一个旋转与同一 `dz`（米 / `dz*100` 厘米）处理。
+
+#### 重力对齐与落地（`align_gravity`）
+
+服务端是重力对齐的**唯一执行方**：客户端拿到 `gravity_aligned=true` 的响应后直接使用数值，不要再做换基、逆共轭或倾斜修正。
+
+- **触发**：`run_ground = want_world || align_gravity` 决定是否解析/推理地面；`align_gravity=true` 且地面变换可用时执行对齐。
+- **旋转**：把地面 up 方向在 Figure 系中的表示 `u_fig = FIGURE_P @ Rᵀ @ e_z` 旋到 `(0,0,1)`，得到真旋转 `S`（Rodrigues，`det=+1`）；`align_angle_deg = acos(u_fig_z)`。
+- **作用范围**：`joints_3d`、`keypoints_3d_coco17`、`generic_pose`（位置绕骨盆支点旋转、`pred_global_rots` 左乘 `S`、`global_rot` 欧拉角同步）、`retarget`（每骨 `global_rotation` 左乘 `S`、`position` 绕骨盆旋转）、`cs`（`bip22_joints` 等米制字段绕 `bip22_joints[1]` 支点旋转，`pose_payload` / `points_53` 等厘米字段按同一支点换算，仅旋转不缩放；`pose_payload.data[6][0]` 相机中心按**米**绕顶层骨盆支点旋转并随 `dz` 落地，`data[6][1]` 的 `torso_length` 保持不变）；`camera` 块恒为相机系，不参与对齐。
+- **落地**：对齐后在 mesh 顶点（缺网格时回退 joints / keypoints）上采样最低 `z`，统一取 `dz = -min_z`，所有位置 `z += dz`；`Bip001 root` 恒置 `z=0`。落地只做平移，不改旋转与朝向。
+- **幂等**：对同一 payload 重复调用会报 `gravity alignment already applied`，不会二次旋转。
+- **元数据**：顶层 `gravity_aligned` / `align_angle_deg` / `gravity_alignment`；`cs`（含 `cs.pose_payload`）与 `retarget` 镜像同名两项。
+
+`gravity_alignment.status` 取值与数值影响：
+
+| status | 含义 | 数值是否改动 |
+|---|---|---|
+| `applied` | 对齐并落地成功 | 已改动 |
+| `skipped`（`reason=disabled`） | `align_gravity=false`；地面变换存在时 `angle_deg` 仍给出诊断角 | 未改动 |
+| `ground_unavailable` | `align_gravity=true` 但地面未就绪/未推理 | 未改动 |
+| `ground_error` | 地面推理报错 | 未改动 |
+| `invalid_direction` | 地面方向退化（`degenerate` / `opposite` / 非正交 / 非真旋转） | 未改动 |
+| `error` | 其他对齐异常 | 未改动 |
+
+未对齐时 `gravity_aligned=false`、`align_angle_deg=null`，并在 `warnings` 追加 `gravity alignment unavailable: <原因>`；`source` 取落地采样来源 `sam3d_mesh` / `joints`，未执行时为 `ground`（地面变换可用）或 `none`。
+
+**无地面路径**（`want_world=false` + `align_gravity=false` + `ground_mode=none`）完全不推理地面：bbox 由 ViTPose 检出（`bbox_source=vitpose`），SAM3D 直接输出相机锚定的 `figure_v6` 姿势，`gravity_alignment.status=skipped`。
+
+#### `world` 块（地面世界系，仅诊断）
 
 与 `/v1/ground` 的 `world` 分组**同源**：同一 `rotate_to_up(plane_normal)` 与 `plane_d`，`ground_normal_world≈[0,0,-1]`、`up_axis_world≈[0,0,1]`、地面 `z=0`。
 
@@ -390,9 +448,9 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 | `generic_pose` / `retarget` | 同源载荷的世界系副本：位置换基，`global_rotation` / `local_rotation` 均按共轭换算 |
 | `mesh` | 仅 `want_mesh=true`：`vertices`（世界系、米）+ `faces` |
 
-> **落地（ground snap）在 SAM-3D 源数据上完成**，不在世界系二次平移：先算出沿世界 +Z 的位移 `dz`（使 SAM-3D 网格最低点落在 `z=0`，网格缺失时回退关节/关键点最低点），把对应的相机系向量 `shift_cam` 直接加到 `pred_joint_coords` / `mhr_joint_coords` / `pred_keypoints_3d` / `pred_vertices` 上（`pred_cam_t` 不变），之后所有下游派生量——顶层 `joints_3d`、`keypoints_3d_coco17`、`generic_pose`、`cs`、`retarget` 以及 `world.*`——天然同一高度，姿势可视化与世界系可视化不会错位。`world` 的几何按三步生成：① 落地后的源数据按 `figure_v6`/相机系规则派生；② 换基到 `ground_world_v1`；③ 叠加 `pred_cam_t`。因换基矩阵满足 `Q·shift_cam = (0,0,dz)`，结果与世界系直接 +Z 平移 `dz` 等价。落地只是刚体平移，不改肢体相对关系、不改旋转，也不改 `rotation`/`translation`/`plane_d_camera` 等相机-地面测量值；位移量见 `ground_snap.offset_m`。`want_world=false`、`ground_mode=none` 或地面不可用时不做落地，返回的是 SAM-3D 原始高度。
+> **`world` 是诊断块，不参与顶层姿势数值**。其几何按三步生成：① 复制一份 SAM-3D 原始输出，沿世界 +Z 落地——算出 `dz` 使网格最低点落在 `z=0`（网格缺失时回退关节/关键点最低点），把相机系向量 `shift_cam` 加到 `pred_joint_coords` / `mhr_joint_coords` / `pred_keypoints_3d` / `pred_vertices` 上（`pred_cam_t` 不变）；② 用这份已落地副本按 `figure_v6`/相机系规则派生；③ 换基到 `ground_world_v1` 并叠加 `pred_cam_t`。因换基矩阵满足 `Q·shift_cam = (0,0,dz)`，结果与世界系直接 +Z 平移 `dz` 等价。落地只是刚体平移，不改肢体相对关系、不改旋转，也不改 `rotation`/`translation`/`plane_d_camera` 等相机-地面测量值；位移量见 `ground_snap.offset_m`。地面不可用时不生成该副本，`world.status` 为 `skipped` / `error`。
 
-> 顶层 `joints_3d` / `keypoints_3d_coco17` / `generic_pose` / `retarget` / `bip22_joints` / `cs` 与 `world` 内的同名副本**逐项一致**（都是 `ground_world_v1`，米；`cs` 为厘米），客户端按世界系解析即可，无需再自行换基。`world` 不可用（`want_world=false`、`ground_mode=none` 或地面推理失败）时才回落到 `figure_v6`，此时所有 `*_frame` 标注如实为 `figure_v6`；`camera` 始终是相机系。
+> 顶层 `joints_3d` / `keypoints_3d_coco17` / `generic_pose` / `retarget` / `bip22_joints` / `cs` **恒为 `figure_v6`**，与 `world` 内的世界系副本不是同一坐标系，两者不可混用。最终交付姿势请读顶层（`align_gravity=true` 时已对齐并落地）；需要 `ground_world_v1` 数值时读 `world.*`；`camera` 始终是相机系。
 
 #### `camera_space` 块（相机锚定回退）
 
@@ -406,16 +464,20 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 | `faces` | number[M][3]，三角面索引 |
 | `keypoints_3d_coco17` | number[17][3]，相机系、米（`pred_keypoints_3d + pred_cam_t`，与网格同系，可直接叠画） |
 
-> 顶点与关键点都来自 SAM-3D 模型系，统一加 `pred_cam_t` 后落在相机系，因此骨架与网格天然重合。此时顶层 `joints_3d` / `keypoints_3d_coco17` 等仍为 `figure_v6`（未落地），需要相机系可视化时请直接用本块。
+> 顶点与关键点都来自 SAM-3D 模型系，统一加 `pred_cam_t` 后落在相机系，因此骨架与网格天然重合。本块恒为原始相机锚定几何，与顶层是否已做重力对齐无关；需要相机系可视化时请直接用本块。
 
 #### v2 XML 响应
 
-`POST /v2/pose/single` 默认返回 `application/xml`：`<poseResponse api_version="3">` 内含 `<poseResult>`（状态、关节、重定向骨、`<restProfile>` 等），并在根节点末尾（`</poseResponse>` 之前）插入本项目扩展的 `<worldPose>`；`<csPose>` 与 `<targetPose>` 的 `frame` 同样是 `ground_world_v1`（`csPose` 额外标注 `unit="centimeter"`）：
+`POST /v2/pose/single` 默认返回 `application/xml`：`<poseResponse api_version="3">` 内含 `<poseResult>`（状态、关节、重定向骨、`<restProfile>` 等）、`<csPose>`（`figure_v6` 数值、厘米；例外：`<camera torso_length=... fov=... aspect=...>` 与 `<center x y z>` 为米，与 CS 序列化器一致）与 `<targetPose>`（`frame="figure_v6"`），并在根节点末尾（`</poseResponse>` 之前）插入本项目扩展的 `<worldPose>`（`ground_world_v1`，仅 `want_world=true` 且地面可用）。
+
+重力对齐元数据以**属性**形式统一写在 `poseResult` / `csPose` / `targetPose` 三个节点上，不新增子节点：`gravity_aligned="true|false"`；角度有限时附 `align_angle_deg="12.860000"`，为 `null` 时省略该属性。
 
 ```xml
 <?xml version='1.0' encoding='utf-8'?>
 <poseResponse api_version="3">
-  <poseResult version="1"> ... </poseResult>
+  <poseResult version="1" gravity_aligned="true" align_angle_deg="12.860000"> ... </poseResult>
+  <csPose version="cs_direct_v6_7" method="applyCharacterStudio" gravity_aligned="true" align_angle_deg="12.860000"> ... </csPose>
+  <targetPose schema="bip22_pose_v5" method="..." frame="figure_v6" unit="meter" gravity_aligned="true" align_angle_deg="12.860000"> ... </targetPose>
   <restProfile ...> ... </restProfile>
   <worldPose frame="ground_world_v1" unit="meter" source="inferred" status="ok">
     <transform rotation="..." translation="0.000000 0.000000 1.114000"/>
@@ -492,7 +554,7 @@ curl -X POST http://127.0.0.1:8004/v1/pose/cancel -H "Content-Type: application/
 | 预备移除（不保证） | `GET /v1/pose/health`、`GET /health`、`GET /v1/pose/info` | `/health` 在本服务中仍是**地面服务**健康检查，语义与参考不同 |
 | 预备移除（不保证） | `retarget_schema=v3` | 仍接受，输出 `bip22_pose_v5`，后续随参考实现一起移除 |
 
-本项目新增（参考实现没有，不影响旧客户端）：`want_world` / `ground_mode` / `ground` / `want_mesh` 与 `world` / `worldPose` 块；无 bundle 且未指定 `retarget_schema=v1` 时，默认用内建 Biped 重定向（`target_status=default`）。
+本项目新增（参考实现没有，不影响旧客户端）：`want_world` / `align_gravity` / `ground_mode` / `ground` / `want_mesh`，以及 `gravity_aligned` / `align_angle_deg` / `gravity_alignment` / `bbox_source` 元数据与 `world` / `worldPose` 块；无 bundle 且未指定 `retarget_schema=v1` 时，默认用内建 Biped 重定向（`target_status=default`）。
 
 ---
 

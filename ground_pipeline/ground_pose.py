@@ -207,17 +207,21 @@ class GroundPoseEstimator:
     def infer(
         self,
         rgb: np.ndarray,
-        person_mask: np.ndarray,
+        person_mask: np.ndarray | None = None,
         want_overlay: bool = False,
         want_mesh: bool = False,
         cam_int: np.ndarray | None = None,
         include_raw: bool = False,
+        bbox: np.ndarray | None = None,
     ) -> dict[str, Any]:
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError("Expected an RGB HxWx3 image")
-        if person_mask.shape != rgb.shape[:2]:
-            raise ValueError("Person mask dimensions do not match the image")
-        bbox = mask_to_bbox(person_mask)
+        if bbox is None:
+            if person_mask is None or person_mask.shape != rgb.shape[:2]:
+                raise ValueError("Person mask dimensions do not match the image")
+            bbox = mask_to_bbox(person_mask)
+        else:
+            bbox = np.asarray(bbox, dtype=np.float32).reshape(1, 4)
         height, width = rgb.shape[:2]
 
         with self._lock, torch.inference_mode():
