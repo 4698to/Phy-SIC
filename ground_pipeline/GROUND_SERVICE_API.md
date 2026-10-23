@@ -368,7 +368,7 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 | `bbox_source` | string | SAM3D 输入 bbox 来源：`mask`（人物分割）/ `vitpose`（地面不可用时 ViTPose 检人框）/ `full_image`（分割失败整图） |
 | `confidence` / `valid_joints` | number[24] / int | 关节置信度 |
 | `keypoints_2d_coco17` | number[17][3] | 图像像素坐标 + 分数 |
-| `keypoints_3d_coco17` | number[17][3] | 3D 关键点，米；坐标系以 `keypoints_3d_coco17_frame` 为准（应用重力对齐后为 `figure_v6`，与 `joints_3d` 同源） |
+| `keypoints_3d_coco17` | number[17][3] | 3D 关键点，米；**默认是 SAM-3D 模型系**（根相对，轴向与相机一致：x 右、y 下、z 前），与 `joints_3d` 不同系。仅当 `align_gravity=true` 且对齐成功时被换基到 `figure_v6`，并同时写出 `keypoints_3d_coco17_frame="figure_v6"`；未对齐时该 frame 字段不存在，字段保持模型系 |
 | `camera` | object | SAM3D 相机估计（内参为模型默认 FOV，非实测标定）；**相机系**，不随骨骼字段换基 |
 | `generic_pose` | object | 参考同构的 127 关节载荷（`pred_joint_coords` / `pred_global_rots` / `global_rot` …），与 `joints_3d` 同属 `figure_v6`；重力对齐时位置按骨盆支点旋转、全局旋转左乘 `S` |
 | `bip22_joints` / `bip22_conf` / `bip22_source` / `bip22_height_m` / `bip22_facing` | - | CS 的 22 骨位置，`figure_v6` 系、米，`[0]` 为落地 root（`z=0`）；`bip22_facing` 为同系方向向量 |
@@ -392,7 +392,8 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 
 | 字段 | 坐标系 | 单位 |
 |---|---|---|
-| `joints_3d`、`keypoints_3d_coco17`、`generic_pose` 位置、`retarget.*.position`、`bip22_joints`、`bip22_height_m` | `figure_v6` | 米 |
+| `joints_3d`、`generic_pose` 位置、`retarget.*.position`、`bip22_joints`、`bip22_height_m` | `figure_v6` | 米 |
+| `keypoints_3d_coco17` | 默认 SAM-3D 模型系；`keypoints_3d_coco17_frame=figure_v6` 时为 `figure_v6` | 米 |
 | `cs.pose_payload` / `cs.bip22_payload` 的位置行、`cs.points_53`、`cs.points_53_tsv` | `figure_v6` | 厘米 |
 | `cs.pose_payload.data[6][0]`（相机中心）、`cs.pose_payload.data[6][1]`（`torso_length`） | `figure_v6` | 米 |
 | `world.*` 位置、`world.ground_snap.offset_m`、`world.min_z_m`、`camera_space.*` 位置 | `ground_world_v1` / `camera_v1` | 米 |
@@ -410,7 +411,7 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 
 - **触发**：`run_ground = want_world || align_gravity` 决定是否解析/推理地面；`align_gravity=true` 且地面变换可用时执行对齐。
 - **旋转**：把地面 up 方向在 Figure 系中的表示 `u_fig = FIGURE_P @ Rᵀ @ e_z` 旋到 `(0,0,1)`，得到真旋转 `S`（Rodrigues，`det=+1`）；`align_angle_deg = acos(u_fig_z)`。
-- **作用范围**：`joints_3d`、`keypoints_3d_coco17`、`generic_pose`（位置绕骨盆支点旋转、`pred_global_rots` 左乘 `S`、`global_rot` 欧拉角同步）、`retarget`（每骨 `global_rotation` 左乘 `S`、`position` 绕骨盆旋转）、`cs`（`bip22_joints` 等米制字段绕 `bip22_joints[1]` 支点旋转，`pose_payload` / `points_53` 等厘米字段按同一支点换算，仅旋转不缩放；`pose_payload.data[6][0]` 相机中心按**米**绕顶层骨盆支点旋转并随 `dz` 落地，`data[6][1]` 的 `torso_length` 保持不变）；`camera` 块恒为相机系，不参与对齐。
+- **作用范围**：`joints_3d`、`keypoints_3d_coco17`（先由模型系换基到 `figure_v6`，再随其余 `figure_v6` 字段一起绕骨盆支点旋转）、`generic_pose`（位置绕骨盆支点旋转、`pred_global_rots` 左乘 `S`、`global_rot` 欧拉角同步）、`retarget`（每骨 `global_rotation` 左乘 `S`、`position` 绕骨盆旋转）、`cs`（`bip22_joints` 等米制字段绕 `bip22_joints[1]` 支点旋转，`pose_payload` / `points_53` 等厘米字段按同一支点换算，仅旋转不缩放；`pose_payload.data[6][0]` 相机中心按**米**绕顶层骨盆支点旋转并随 `dz` 落地，`data[6][1]` 的 `torso_length` 保持不变）；`camera` 块恒为相机系，不参与对齐。
 - **落地**：对齐后在 mesh 顶点（缺网格时回退 joints / keypoints）上采样最低 `z`，统一取 `dz = -min_z`，所有位置 `z += dz`；`Bip001 root` 恒置 `z=0`。落地只做平移，不改旋转与朝向。
 - **幂等**：对同一 payload 重复调用会报 `gravity alignment already applied`，不会二次旋转。
 - **元数据**：顶层 `gravity_aligned` / `align_angle_deg` / `gravity_alignment`；`cs`（含 `cs.pose_payload`）与 `retarget` 镜像同名两项。
@@ -450,7 +451,7 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 
 > **`world` 是诊断块，不参与顶层姿势数值**。其几何按三步生成：① 复制一份 SAM-3D 原始输出，沿世界 +Z 落地——算出 `dz` 使网格最低点落在 `z=0`（网格缺失时回退关节/关键点最低点），把相机系向量 `shift_cam` 加到 `pred_joint_coords` / `mhr_joint_coords` / `pred_keypoints_3d` / `pred_vertices` 上（`pred_cam_t` 不变）；② 用这份已落地副本按 `figure_v6`/相机系规则派生；③ 换基到 `ground_world_v1` 并叠加 `pred_cam_t`。因换基矩阵满足 `Q·shift_cam = (0,0,dz)`，结果与世界系直接 +Z 平移 `dz` 等价。落地只是刚体平移，不改肢体相对关系、不改旋转，也不改 `rotation`/`translation`/`plane_d_camera` 等相机-地面测量值；位移量见 `ground_snap.offset_m`。地面不可用时不生成该副本，`world.status` 为 `skipped` / `error`。
 
-> 顶层 `joints_3d` / `keypoints_3d_coco17` / `generic_pose` / `retarget` / `bip22_joints` / `cs` **恒为 `figure_v6`**，与 `world` 内的世界系副本不是同一坐标系，两者不可混用。最终交付姿势请读顶层（`align_gravity=true` 时已对齐并落地）；需要 `ground_world_v1` 数值时读 `world.*`；`camera` 始终是相机系。
+> 顶层 `joints_3d` / `generic_pose` / `retarget` / `bip22_joints` / `cs` **恒为 `figure_v6`**；`keypoints_3d_coco17` 例外——默认是 SAM-3D 模型系，只有重力对齐成功后才换基到 `figure_v6`（并写 `keypoints_3d_coco17_frame`）。它们与 `world` 内的世界系副本不是同一坐标系，不可混用。最终交付姿势请读顶层（`align_gravity=true` 时已对齐并落地）；需要 `ground_world_v1` 数值时读 `world.*`；`camera` 始终是相机系。
 
 #### `camera_space` 块（相机锚定回退）
 
