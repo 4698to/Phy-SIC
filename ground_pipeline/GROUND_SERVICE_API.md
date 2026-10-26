@@ -131,7 +131,7 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
 
 #### 姿势输出（`pose_inference=true`）
 
-姿势推理是同一 ground 进程内可选的 SAM3D Body ViT-H 能力，不新增 HTTP 服务；bbox 来自 LangSAM 人物 mask 的图像像素范围并作边界扩展。P0 每张图只推理一个合并 mask 对应的 bbox，不运行 ViTPose，也不承诺多人分离。`pose_inference=false` 时省略 `pose` 字段。
+姿势推理是同一 ground 进程内可选的 SAM3D Body ViT-H 能力，不新增 HTTP 服务；bbox 来自 LangSAM 人物 mask 的图像像素范围并作边界扩展。P0 每张图只推理一个合并 mask 对应的 bbox，不运行 ViTPose，也不承诺多人分离。`pose_inference=false` 时省略 `pose` 字段。`pose_inference=true` 与 `/v1/pose/single` 共用同一 GPU 队列，但以低优先级（`priority=5`）入队，交互式姿势请求优先；排队被拒或超时时姿势子任务降级为 `pose.status=error`（带 `error_code` / `error`），地面结果照常返回。
 
 | `pose` 字段 | 说明 |
 |---|---|
@@ -304,6 +304,10 @@ P0 不返回 ViTPose 2D keypoints/confidence，也不把 `joints_3d` 变换到 g
 | `POST /v2/pose/single` | 单张图片推理，响应默认 XML，可用 `response_format` / `Accept` 切 JSON |
 | `POST /v1/pose/cancel` | 按 `request_id` 取消排队/进行中的推理（JSON） |
 | `POST /v2/pose/cancel` | 同上（XML） |
+| `GET /v1/pose/queue` | 队列快照：`pending` / `running` / `per_client` / 统计（JSON） |
+| `GET /metrics` | Prometheus 文本指标（含 `pose_queue_*`），`text/plain; version=0.0.4` |
+
+> GPU 同一时刻只执行一个姿势任务，但并发请求不再直接失败：请求进入 FIFO 队列（优先级 + 等待老化），按容量与客户端配额限流。默认容量 16、单客户端 4、排队超时 60s；`--pose-queue-size=0` 可回滚为旧行为（空闲也允许 1 个任务，忙时立即 503 `gpu_busy`）。
 
 #### 请求字段
 
@@ -313,6 +317,8 @@ P0 不返回 ViTPose 2D keypoints/confidence，也不把 `joints_3d` 变换到 g
 |---|---|---|---|---|
 | `image` | string | 是 | - | 三种格式任选：Base64 data URI、HTTP(S) URL、服务端本地文件路径（可用 `image_path` 代替） |
 | `request_id` | string | 否 | 自动生成 | 自定义任务号，用于 `/v1|v2/pose/cancel` 与日志关联 |
+| `client_id` | string | 否 | 对端 IP | 客户端标识，用于单客户端并发配额（也可用请求头 `X-Pose-Client-Id`；缺失时取对端 IP） |
+| `queue_timeout_s` | number | 否 | 服务默认 60 | 本请求在队列中的最长等待秒数；超时返回 503 `queue_timeout`。只约束排队，已开始的推理不会被中断 |
 | `engine` | string | 否 | `sam3d_vitpose` | 仅支持该值；其它值返回 **200 + `status=error`**（与参考实现一致） |
 | `want_overlay` | bool | 否 | `true` | 返回 COCO-17 2D 骨架叠加图（`overlay_jpeg_b64`，**裸 Base64**，无 `data:image` 前缀）；`world.status=ok` 时先叠加检测到的地平面网格 |
 | `want_raw` | bool | 否 | `false` | 返回 SAM3D 原始输出（127 关节、旋转、关键点、`pred_cam_t` 等），字段与参考实现同名 |
@@ -384,6 +390,7 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 | `camera_space` | object | **相机锚定回退**：`want_mesh=true` 且 `world` 不可用时返回，见下 |
 | `overlay_jpeg_b64` | string | `want_overlay=true` 时的 JPEG **裸 Base64**（失败写 `overlay_error`）；`world.status=ok` 时图中叠加地平面网格，`want_world=false` 或地面 `skipped` 时只有骨架 |
 | `request_id` / `time_ms` | string / number | 任务号与本次耗时 |
+| `queue` | object | 调度信息（仅 JSON；v2 XML 不输出）：`priority`、`ahead`（入队时前方任务数）、`wait_ms`（排队时长；pending 取消时为实际等待）、`exec_ms`（执行时长）、`pending_at_start`（开始执行时剩余排队数）、`eta_ms`（入队时按 `ahead × 平均执行时长` 估算，仅供参考） |
 | `error` | string | 失败原因 |
 
 > 叠加图内容：`world.status=ok` 时先用 `world.rotation` / `world.plane_normal_camera` / `world.plane_d_camera` 与 `camera.focal_px` 把地平面网格投影到图像（橙色细线、55% 混合，网格与世界轴对齐并以世界原点对齐线段），再画 COCO-17 骨架；因此在同一张图里可直接核对骨架是否站在检测到的地面上。网格仅在 `want_world=true`（默认）且地面成功时绘制，`ground_mode=none` 或 `world.status=skipped/error` 时只返回骨架图。
@@ -522,6 +529,7 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
   "models": {"sam3d": "sam-3d-body-vith", "vitpose": "disabled"},
   "world": {"ready": true, "segmenter": true, "depth": true},
   "retarget": {"ready": true, "skeleton_id": "mhr_biped_standard", "bone_count": 66, "mapping_bone_count": 27, "fingerprint": "sha256:...", "chains": ["spine", "neck", "finger_L_Finger0", "finger_L_Finger1", "finger_R_Finger0", "finger_R_Finger1"]},
+  "queue": {"enabled": true, "pending": 0, "capacity": 16, "running": false},
   "endpoints": ["GET /v1/pose/health", "..."],
   "disabled_reason": "",
   "skeleton_source": "MHR127_direct"
@@ -531,11 +539,14 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 ```bash
 curl -X POST http://127.0.0.1:8004/v1/pose/cancel -H "Content-Type: application/json" \
   -d '{"request_id": "6f87f78bbb8b44cbb80cf874365e5258"}'
-# 200 {"request_id": "...", "cancelled": true}
+# 200 {"request_id": "...", "cancelled": true, "state": "pending", "ahead": 2}
+# 200 {"request_id": "...", "cancelled": true, "state": "running", "ahead": 0}
 # 404 {"request_id": "...", "cancelled": false, "error": "未找到任务"}
 ```
 
-推理本身是同步的：`request_id` 只在请求执行期间登记，取消用于释放排队等待与中途放弃，已返回的 200 响应不会被改写。同一时刻只允许一个姿势任务占用 GPU，并发请求返回 503 `GPU 忙，请稍后重试`。
+排队语义：`pending` 任务可立即取消（waiter 立刻返回 `200 status=cancelled`）；`running` 任务只置取消标记，管线在 SAM3D、重定向等检查点退出并返回 `status=cancelled`，已发出的 200 响应不会被改写。`state` / `ahead` 仅 JSON 取消响应包含，v2 XML 维持 `poseCancelResult` 原结构。
+
+`GET /v1/pose/queue` 返回 `snapshot()`：`capacity`、`pending`、`running`（`null` 或 `request_id` / `client` / `exec_ms` / `overdue`）、`per_client`、`stats`（`admitted` / `completed` / `rejected_full` / `rejected_quota` / `timed_out` / `cancelled_pending` / `cancelled_running` / `avg_wait_ms` / `p95_wait_ms` / `avg_exec_ms`）与 `worker_alive`。`GET /metrics` 暴露 `pose_queue_capacity`、`pose_queue_pending`、`pose_queue_running`、`pose_queue_per_client`、`pose_queue_admitted_total`、`pose_queue_completed_total{status}`、`pose_queue_rejected_total{reason}`、`pose_queue_timed_out_total`、`pose_queue_cancelled_total{state}` 以及等待/执行时长直方图；`client` 标签可用 `--pose-metrics-client-label=0` 关闭以降低基数。
 
 #### 错误响应
 
@@ -545,7 +556,9 @@ curl -X POST http://127.0.0.1:8004/v1/pose/cancel -H "Content-Type: application/
 | `404` | `cancel` 的 `request_id` 未找到 |
 | `413` | 请求体或图片超过 40 MB |
 | `500` | 推理异常、`generic_pose` 组装或重定向失败 |
-| `503` | SAM3D 未配置/加载失败、重定向资产缺失、`ground_mode=infer` 但地面模型未就绪、GPU 忙 |
+| `503` | SAM3D 未配置/加载失败、重定向资产缺失、`ground_mode=infer` 但地面模型未就绪、队列已满、客户端配额已满、排队超时、队列未启用时 GPU 忙 |
+
+503 错误体在通用错误字段之外增加 `error_code`（`queue_full` / `client_quota` / `queue_timeout` / `gpu_busy` / `queue_unavailable`）、`queue`（同成功响应的调度信息）与 `retry_after_s`，并带 `Retry-After` 响应头（`queue_full` / `gpu_busy` 2s，`client_quota` / `queue_timeout` 5s）。
 
 错误响应体为 `{"status": "error", "engine": "sam3d_vitpose", "error": "stage: ...", "request_id": "...", "target_status": "..."}`（v2 XML 同样生效，错误也按 XML 输出）。
 
@@ -645,3 +658,5 @@ for key in ("overlay", "views"):
 4. **不要动模型加载顺序**：`lifespan` 中必须先加载 DepthPro 再加载 LangSAM（SAM2 若作为第一个 CUDA 模型会导致 WSL VM 崩溃），请勿调整该顺序。
 5. **本机免端口映射**，仅局域网跨机访问需要 [map_ground.bat](file:///G:/UGit/Phy-SIC/ground_pipeline/map_ground.bat)。
 6. **OpenAPI 文档**：服务自带 Swagger，浏览器打开 `http://127.0.0.1:8001/docs` 可在线调试。
+7. **并发与排队**：姿态推理并发请求不再返回 503「GPU 忙」，而是进入队列等待；请为客户端预留 `排队时长 + 单次推理耗时` 的总超时（建议 ≥ `queue_timeout_s + 120s`），并在收到 503 `queue_full` / `client_quota` / `queue_timeout` 时按 `Retry-After` 退避重试。批量场景建议显式传 `client_id` 并控制单客户端并发不超过 `--pose-queue-per-client`。
+8. **队列调参**：`--pose-queue-size`（默认 16）、`--pose-queue-timeout`（60s）、`--pose-queue-per-client`（4）、`--pose-queue-aging`（30s，等待越久优先级越高）、`--pose-queue-exec-timeout`（300s，仅告警不中断）、`--pose-metrics-client-label`（默认 1）；对应环境变量前缀 `POSEEXTRACTOR_`（如 `POSEEXTRACTOR_POSE_QUEUE_SIZE`）。

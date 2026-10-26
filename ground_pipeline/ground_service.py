@@ -34,6 +34,14 @@ import depth_pro
 from lang_sam import LangSAM
 
 from ground_pipeline import extract_ground
+from ground_pipeline.pose_queue import (
+    PRIORITY_GROUND,
+    PRIORITY_INTERACTIVE,
+    PoseJob,
+    PoseQueue,
+    QueueRejected,
+    QueueTimeout,
+)
 from ground_pipeline.ground_retarget import (
     GroundTransform,
     RetargetAdapter,
@@ -1440,6 +1448,8 @@ POSE_ENDPOINTS = (
     "POST /v2/pose/single",
     "POST /v1/pose/cancel",
     "POST /v2/pose/cancel",
+    "GET /v1/pose/queue",
+    "GET /metrics",
 )
 
 
@@ -1634,23 +1644,88 @@ def _pose_error_body(
     request_id: str = "",
     target: Optional[Dict[str, Any]] = None,
     target_status: str = "",
+    error_code: str = "",
+    queue: Optional[Dict[str, Any]] = None,
+    retry_after_s: Optional[int] = None,
 ) -> Dict[str, Any]:
     body: Dict[str, Any] = {"status": "error", "engine": POSE_ENGINE, "error": str(message)}
     if request_id:
         body["request_id"] = request_id
+    if error_code:
+        body["error_code"] = error_code
     if target is not None:
         body.update(_pose_target_fields(target))
     if target_status:
         body["target_status"] = target_status
+    if queue is not None:
+        body["queue"] = queue
+    if retry_after_s is not None:
+        body["retry_after_s"] = retry_after_s
     return body
 
 
-def _pose_cancelled_body(request_id: str) -> Dict[str, Any]:
-    return {
+def _pose_cancelled_body(request_id: str, *, queue: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
         "status": "cancelled",
         "engine": POSE_ENGINE,
         "request_id": request_id,
         "error": "任务已取消",
+    }
+    if queue is not None:
+        body["queue"] = queue
+    return body
+
+
+_POSE_QUEUE_ERROR_MESSAGES = {
+    "queue_full": "队列已满（{pending}/{capacity}），请稍后重试",
+    "client_quota": "客户端并发配额已满（{limit}），请稍后重试",
+    "gpu_busy": "GPU 忙，请稍后重试",
+}
+_POSE_QUEUE_RETRY_AFTER = {"queue_full": 2, "client_quota": 5, "queue_timeout": 5, "gpu_busy": 2}
+
+
+def _pose_client_key(data: Dict[str, Any], request: Any) -> str:
+    """配额键：请求体 ``client_id`` > ``X-Pose-Client-Id`` 头 > 对端 IP。"""
+    client = str(data.get("client_id") or "").strip()
+    if not client:
+        headers = getattr(request, "headers", None)
+        client = str(headers.get("x-pose-client-id") or "").strip() if headers is not None else ""
+    if not client:
+        peer = getattr(request, "client", None)
+        client = str(getattr(peer, "host", "") or "").strip()
+    return client or "unknown"
+
+
+def _pose_queue_info(job: PoseJob) -> Dict[str, Any]:
+    """任务的排队/执行耗时，写入成功响应与取消响应。"""
+    wait_ms = 0.0
+    exec_ms = 0.0
+    if job.started_at is not None:
+        wait_ms = (job.started_at - job.enqueued_at) * 1000.0
+    elif job.finished_at is not None:
+        wait_ms = (job.finished_at - job.enqueued_at) * 1000.0
+    if job.started_at is not None and job.finished_at is not None:
+        exec_ms = (job.finished_at - job.started_at) * 1000.0
+    return {
+        "priority": job.priority,
+        "ahead": job.ahead,
+        "wait_ms": round(wait_ms, 1),
+        "exec_ms": round(exec_ms, 1),
+        "pending_at_start": job.pending_at_start,
+        "eta_ms": int(round(job.eta_ms)),
+    }
+
+
+def _pose_queue_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """队列快照 -> 错误响应里的精简块。"""
+    stats = snapshot.get("stats") or {}
+    pending = int(snapshot.get("pending") or 0)
+    avg_exec = float(stats.get("avg_exec_ms") or 0.0)
+    return {
+        "pending": pending,
+        "capacity": int(snapshot.get("capacity") or 0),
+        "running": snapshot.get("running") is not None,
+        "eta_ms": int(round(pending * avg_exec)),
     }
 
 
@@ -1671,6 +1746,7 @@ def _pose_response_serializer(state: Dict[str, Any]) -> Optional[Any]:
 
 def _pose_health(state: Dict[str, Any]) -> Dict[str, Any]:
     adapter = state.get("retarget")
+    queue = state.get("pose_queue")
     engine_ready = state.get("pose_estimator") is not None
     adapter_health = adapter.health() if adapter is not None else {"ready": False, "error": "适配层未加载"}
     ground_ready = state.get("segmenter") is not None and state.get("depth") is not None
@@ -1704,6 +1780,9 @@ def _pose_health(state: Dict[str, Any]) -> Dict[str, Any]:
             "depth": state.get("depth") is not None,
         },
         "retarget": adapter_health,
+        "queue": queue.summary()
+        if queue is not None
+        else {"enabled": False, "capacity": 0, "pending": 0, "running": False},
         "endpoints": list(POSE_ENDPOINTS),
         "disabled_reason": disabled_reason,
         "skeleton_source": "MHR127_direct",
@@ -2028,20 +2107,25 @@ async def _pose_read_request(request: Request, content_type: str) -> Tuple[Dict[
     return payload, None
 
 
-def _pose_single_pipeline(
+def _pose_prepare(
     state: Dict[str, Any],
     data: Dict[str, Any],
     *,
     upload: Optional[bytes] = None,
-) -> Tuple[int, Dict[str, Any]]:
-    """同步执行一次姿势推理，返回 (HTTP 状态码, 响应 body)。"""
+) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple[int, Dict[str, Any]]]]:
+    """请求线程内的 CPU 段：校验、读图、目标解析（不触碰 GPU）。
+
+    返回 ``(prepared, None)`` 或 ``(None, (http_code, body))``；失败在入队前返回，
+    不占用队列等待位。
+    """
     started = time.perf_counter()
     request_id = str(data.get("request_id") or "").strip()
     engine = str(data.get("engine") or "").strip()
     if engine and engine != POSE_ENGINE:
         # 参考实现：engine 非法属于业务失败，HTTP 200 + status=error
-        return 200, _pose_error_body(
-            f"不支持的 engine: {engine}（仅 {POSE_ENGINE}）", request_id=request_id
+        return None, (
+            200,
+            _pose_error_body(f"不支持的 engine: {engine}（仅 {POSE_ENGINE}）", request_id=request_id),
         )
     try:
         want_overlay = _pose_as_bool(data.get("want_overlay"), True)
@@ -2050,35 +2134,45 @@ def _pose_single_pipeline(
         want_mesh = _pose_as_bool(data.get("want_mesh"), False)
         align_gravity = _pose_as_bool(data.get("align_gravity"), want_world)
     except ValueError as exc:
-        return 400, _pose_error_body(str(exc), request_id=request_id)
+        return None, (400, _pose_error_body(str(exc), request_id=request_id))
 
     ground_mode = str(data.get("ground_mode") or "auto").strip().lower() or "auto"
     if ground_mode not in POSE_GROUND_MODES:
-        return 400, _pose_error_body(
-            f"不支持的 ground_mode: {ground_mode}（仅 {'/'.join(POSE_GROUND_MODES)}）",
-            request_id=request_id,
+        return None, (
+            400,
+            _pose_error_body(
+                f"不支持的 ground_mode: {ground_mode}（仅 {'/'.join(POSE_GROUND_MODES)}）",
+                request_id=request_id,
+            ),
         )
     if ground_mode == "request" and not isinstance(data.get("ground"), dict):
-        return 400, _pose_error_body(
-            "world: ground_mode=request 但未提供 ground", request_id=request_id
+        return None, (
+            400,
+            _pose_error_body("world: ground_mode=request 但未提供 ground", request_id=request_id),
         )
 
     estimator = state.get("pose_estimator")
     if estimator is None:
-        return 503, _pose_error_body(
-            f"engine: {state.get('pose_error') or 'SAM3D 未配置或加载失败'}", request_id=request_id
+        return None, (
+            503,
+            _pose_error_body(
+                f"engine: {state.get('pose_error') or 'SAM3D 未配置或加载失败'}", request_id=request_id
+            ),
         )
     adapter = state.get("retarget")
     if adapter is None or not adapter.ready:
         detail = str(getattr(adapter, "error", "") or "重定向资产不可用")
-        return 503, _pose_error_body(f"retarget_assets: {detail}", request_id=request_id)
+        return None, (503, _pose_error_body(f"retarget_assets: {detail}", request_id=request_id))
 
     try:
         rgb = _pose_load_image(data, upload)
     except _PosePayloadTooLarge as exc:
-        return 413, _pose_error_body(str(exc), request_id=request_id)
+        return None, (413, _pose_error_body(str(exc), request_id=request_id))
     except Exception as exc:  # noqa: BLE001
-        return 400, _pose_error_body(f"image: {type(exc).__name__}: {exc}", request_id=request_id)
+        return None, (
+            400,
+            _pose_error_body(f"image: {type(exc).__name__}: {exc}", request_id=request_id),
+        )
 
     requested_schema = str(data.get("retarget_schema") or "auto").strip().lower() or "auto"
     if requested_schema == "v1":
@@ -2094,212 +2188,450 @@ def _pose_single_pipeline(
         try:
             target = adapter.resolve_target(data)
         except RetargetError as exc:
-            return exc.status_code, _pose_error_body(
-                f"{exc.stage}: {exc}",
-                request_id=request_id,
-                target_status=exc.target_status or "rejected",
+            return None, (
+                exc.status_code,
+                _pose_error_body(
+                    f"{exc.stage}: {exc}",
+                    request_id=request_id,
+                    target_status=exc.target_status or "rejected",
+                ),
             )
-
-    lock: threading.Lock = state["pose_lock"]
-    if not lock.acquire(blocking=False):
-        return 503, _pose_error_body("GPU 忙，请稍后重试", request_id=request_id, target=target)
 
     rid = request_id or uuid.uuid4().hex
-    cancel = threading.Event()
-    state["pose_tasks"][rid] = cancel
+    return (
+        {
+            "request_id": rid,
+            "started": started,
+            "rgb": rgb,
+            "data": data,
+            "target": target,
+            "estimator": estimator,
+            "adapter": adapter,
+            "want_overlay": want_overlay,
+            "want_raw": want_raw,
+            "want_world": want_world,
+            "want_mesh": want_mesh,
+            "align_gravity": align_gravity,
+            "ground_mode": ground_mode,
+        },
+        None,
+    )
+
+
+def _pose_execute(
+    state: Dict[str, Any],
+    prepared: Dict[str, Any],
+    cancel: threading.Event,
+    *,
+    queue_info: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, Dict[str, Any]]:
+    """worker 线程内的 GPU 段：分割 -> 地面 -> SAM3D -> 落地/重定向 -> world/overlay。"""
+    exec_started = time.perf_counter()
+    rid: str = prepared["request_id"]
+    started: float = prepared["started"]
+    rgb: np.ndarray = prepared["rgb"]
+    data: Dict[str, Any] = prepared["data"]
+    target: Dict[str, Any] = prepared["target"]
+    estimator = prepared["estimator"]
+    adapter = prepared["adapter"]
+    want_overlay: bool = prepared["want_overlay"]
+    want_raw: bool = prepared["want_raw"]
+    want_world: bool = prepared["want_world"]
+    want_mesh: bool = prepared["want_mesh"]
+    align_gravity: bool = prepared["align_gravity"]
+    ground_mode: str = prepared["ground_mode"]
+
+    image_pil = __import__("PIL").Image.fromarray(rgb)
+    person_mask = None
     try:
-        image_pil = __import__("PIL").Image.fromarray(rgb)
-        person_mask = None
+        person_mask = _person_mask(state["segmenter"], image_pil, state.get("person_prompt") or "")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("人物分割失败，改用整图 bbox: %s", exc)
+    if person_mask is None or not np.asarray(person_mask).any():
+        person_mask = np.ones(rgb.shape[:2], dtype=bool)
+        bbox_source = "full_image"
+    else:
+        bbox_source = "mask"
+
+    ground_transform: Optional[GroundTransform] = None
+    ground_status = "skipped"
+    ground_error: Optional[str] = None
+    landing: Optional[Dict[str, Any]] = None
+    world_raw = None
+    run_ground = want_world or align_gravity
+    if run_ground:
         try:
-            person_mask = _person_mask(state["segmenter"], image_pil, state.get("person_prompt") or "")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("人物分割失败，改用整图 bbox: %s", exc)
-        if person_mask is None or not np.asarray(person_mask).any():
-            person_mask = np.ones(rgb.shape[:2], dtype=bool)
-            bbox_source = "full_image"
-        else:
-            bbox_source = "mask"
-
-        ground_transform: Optional[GroundTransform] = None
-        ground_status = "skipped"
-        ground_error: Optional[str] = None
-        landing: Optional[Dict[str, Any]] = None
-        world_raw = None
-        run_ground = want_world or align_gravity
-        if run_ground:
-            try:
-                ground_transform, ground_status, ground_error = _pose_resolve_ground(
-                    state,
-                    data=data,
-                    ground_mode=ground_mode,
-                    rgb=rgb,
-                    default_floor_prompt=state.get("floor_prompt") or DEFAULT_FLOOR_PROMPT,
-                )
-            except RetargetError as exc:
-                if want_world:
-                    return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
-                ground_status, ground_error = "error", str(exc)
-
-        # bbox 决策：地面可用 -> mask 框；地面不可用 -> ViTPose 框（不可用再回退 mask/整图）
-        pose_bbox = None
-        if ground_transform is None:
-            pose_bbox = _pose_vitpose_bbox(rgb)
-            if pose_bbox is not None:
-                bbox_source = "vitpose"
-
-        try:
-            pose = estimator.infer(
-                rgb,
-                person_mask,
-                want_overlay=False,
-                want_mesh=False,
-                cam_int=None,
-                include_raw=True,
-                bbox=pose_bbox[0] if pose_bbox is not None else None,
-            )
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            return 503, _pose_error_body("engine: CUDA 显存不足，请稍后重试", request_id=rid, target=target)
-        except RuntimeError as exc:
-            if "did not return" in str(exc):
-                # 参考实现：未检出人物属于业务失败，HTTP 200 + status=error
-                return 200, _pose_error_body(f"detect: 未检出人物（{exc}）", request_id=rid, target=target)
-            logger.exception("SAM3D 姿势推理失败")
-            return 500, _pose_error_body(f"engine: {type(exc).__name__}: {exc}", request_id=rid, target=target)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("SAM3D 姿势推理失败")
-            return 500, _pose_error_body(f"engine: {type(exc).__name__}: {exc}", request_id=rid, target=target)
-
-        if cancel.is_set():
-            return 200, _pose_cancelled_body(rid)
-
-        raw = pose.get("raw") or {}
-        world_raw = raw
-        if ground_transform is not None:
-            landing_state = _pose_apply_landing(ground_transform, raw)
-            landing = landing_state["report"]
-            world_raw = landing_state["raw"]
-
-        try:
-            body, internal = adapter.assemble_pose(
-                raw,
-                pose.get("camera") or {},
-                want_raw=want_raw,
-                require_generic=target.get("schema") != "v1",
-                bbox=pose.get("bbox_2d_xyxy"),
+            ground_transform, ground_status, ground_error = _pose_resolve_ground(
+                state,
+                data=data,
+                ground_mode=ground_mode,
+                rgb=rgb,
+                default_floor_prompt=state.get("floor_prompt") or DEFAULT_FLOOR_PROMPT,
             )
         except RetargetError as exc:
-            return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+            if want_world:
+                return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+            ground_status, ground_error = "error", str(exc)
 
-        # 目标骨架重定向（figure_v6 系）
-        retarget_status = "skipped"
-        if target.get("schema") not in (None, "", "v1"):
+    # bbox 决策：地面可用 -> mask 框；地面不可用 -> ViTPose 框（不可用再回退 mask/整图）
+    pose_bbox = None
+    if ground_transform is None:
+        pose_bbox = _pose_vitpose_bbox(rgb)
+        if pose_bbox is not None:
+            bbox_source = "vitpose"
+
+    try:
+        pose = estimator.infer(
+            rgb,
+            person_mask,
+            want_overlay=False,
+            want_mesh=False,
+            cam_int=None,
+            include_raw=True,
+            bbox=pose_bbox[0] if pose_bbox is not None else None,
+        )
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return 503, _pose_error_body("engine: CUDA 显存不足，请稍后重试", request_id=rid, target=target)
+    except RuntimeError as exc:
+        if "did not return" in str(exc):
+            # 参考实现：未检出人物属于业务失败，HTTP 200 + status=error
+            return 200, _pose_error_body(f"detect: 未检出人物（{exc}）", request_id=rid, target=target)
+        logger.exception("SAM3D 姿势推理失败")
+        return 500, _pose_error_body(f"engine: {type(exc).__name__}: {exc}", request_id=rid, target=target)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("SAM3D 姿势推理失败")
+        return 500, _pose_error_body(f"engine: {type(exc).__name__}: {exc}", request_id=rid, target=target)
+
+    if cancel.is_set():
+        return 200, _pose_cancelled_body(rid)
+
+    raw = pose.get("raw") or {}
+    world_raw = raw
+    if ground_transform is not None:
+        landing_state = _pose_apply_landing(ground_transform, raw)
+        landing = landing_state["report"]
+        world_raw = landing_state["raw"]
+
+    try:
+        body, internal = adapter.assemble_pose(
+            raw,
+            pose.get("camera") or {},
+            want_raw=want_raw,
+            require_generic=target.get("schema") != "v1",
+            bbox=pose.get("bbox_2d_xyxy"),
+        )
+    except RetargetError as exc:
+        return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+
+    # 目标骨架重定向（figure_v6 系）
+    retarget_status = "skipped"
+    if target.get("schema") not in (None, "", "v1"):
+        try:
+            result = adapter.retarget(internal.get("generic") or {}, target)
+        except RetargetError as exc:
+            return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+        if result:
+            body["retarget"] = result["payload"]
+            body["retarget_schema"] = result["schema"]
+            body["retarget_diagnostics"] = result.get("diagnostics") or {}
+            retarget_status = "ok"
+    body["retarget_status"] = retarget_status
+
+    profile = target.get("profile") if isinstance(target.get("profile"), dict) else {}
+    profile_rest = profile.get("target_tpose_bundle_rest_profile") or profile.get("biped_rest_profile")
+    if isinstance(profile_rest, dict) and profile_rest:
+        body["profile_rest"] = profile_rest
+        body["profile_rest_scope"] = "mapped"
+
+    # 取消检查点（SAM3D 之后、重定向之后、world 之前）
+    if cancel.is_set():
+        return 200, _pose_cancelled_body(rid)
+
+    world = None
+    if want_world:
+        if cancel.is_set():
+            return 200, _pose_cancelled_body(rid)
+        if ground_transform is not None:
             try:
-                result = adapter.retarget(internal.get("generic") or {}, target)
+                world_body, world_internal = adapter.assemble_pose(
+                    world_raw,
+                    pose.get("camera") or {},
+                    want_raw=False,
+                    require_generic=target.get("schema") != "v1",
+                    bbox=pose.get("bbox_2d_xyxy"),
+                )
+                if target.get("schema") not in (None, "", "v1"):
+                    world_retarget = adapter.retarget(world_internal.get("generic") or {}, target)
+                    if world_retarget:
+                        world_body["retarget"] = world_retarget["payload"]
+                world = _pose_resolve_world(
+                    state,
+                    transform=ground_transform,
+                    ground_mode=ground_mode,
+                    internal=world_internal,
+                    body=world_body,
+                    want_mesh=want_mesh,
+                    raw=world_raw,
+                    ground_snap=landing,
+                )
             except RetargetError as exc:
                 return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
-            if result:
-                body["retarget"] = result["payload"]
-                body["retarget_schema"] = result["schema"]
-                body["retarget_diagnostics"] = result.get("diagnostics") or {}
-                retarget_status = "ok"
-        body["retarget_status"] = retarget_status
+        else:
+            world = skipped_world(ground_status, ground_mode=ground_mode, error=ground_error)
+        body["world"] = world
 
-        profile = target.get("profile") if isinstance(target.get("profile"), dict) else {}
-        profile_rest = profile.get("target_tpose_bundle_rest_profile") or profile.get("biped_rest_profile")
-        if isinstance(profile_rest, dict) and profile_rest:
-            body["profile_rest"] = profile_rest
-            body["profile_rest_scope"] = "mapped"
+    resolve_gravity_alignment(
+        body,
+        ground_transform,
+        align=align_gravity,
+        ground_status=ground_status,
+        ground_error=ground_error,
+        mesh_vertices=raw.get("pred_vertices"),
+    )
+    body["bbox_source"] = bbox_source
+    body["sam3d_inference_type"] = pose.get("sam3d_inference_type")
+    body["sam3d_upscale"] = pose.get("sam3d_upscale")
 
-        world = None
-        if want_world:
-            if cancel.is_set():
-                return 200, _pose_cancelled_body(rid)
-            if ground_transform is not None:
-                try:
-                    world_body, world_internal = adapter.assemble_pose(
-                        world_raw,
-                        pose.get("camera") or {},
-                        want_raw=False,
-                        require_generic=target.get("schema") != "v1",
-                        bbox=pose.get("bbox_2d_xyxy"),
-                    )
-                    if target.get("schema") not in (None, "", "v1"):
-                        world_retarget = adapter.retarget(world_internal.get("generic") or {}, target)
-                        if world_retarget:
-                            world_body["retarget"] = world_retarget["payload"]
-                    world = _pose_resolve_world(
-                        state,
-                        transform=ground_transform,
-                        ground_mode=ground_mode,
-                        internal=world_internal,
-                        body=world_body,
-                        want_mesh=want_mesh,
-                        raw=world_raw,
-                        ground_snap=landing,
-                    )
-                except RetargetError as exc:
-                    return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
-            else:
-                world = skipped_world(ground_status, ground_mode=ground_mode, error=ground_error)
-            body["world"] = world
+    # 无可靠世界系（want_world=false 或地面推理失败）时，额外给出相机锚定回退块
+    if want_mesh and (world is None or world.get("status") != "ok"):
+        cam_block = _pose_camera_space_block(state, raw, internal.get("keypoints_3d_cam"))
+        if cam_block is not None:
+            body["camera_space"] = cam_block
 
-        resolve_gravity_alignment(
-            body,
-            ground_transform,
-            align=align_gravity,
-            ground_status=ground_status,
-            ground_error=ground_error,
-            mesh_vertices=raw.get("pred_vertices"),
+    if want_overlay:
+        overlay = _pose_overlay_b64(
+            adapter,
+            rgb,
+            body.get("keypoints_2d_coco17"),
+            world=world,
+            camera=body.get("camera"),
         )
-        body["bbox_source"] = bbox_source
-        body["sam3d_inference_type"] = pose.get("sam3d_inference_type")
-        body["sam3d_upscale"] = pose.get("sam3d_upscale")
+        if overlay:
+            body["overlay_jpeg_b64"] = overlay
+        else:
+            body["overlay_error"] = "overlay 生成失败"
 
-        # 无可靠世界系（want_world=false 或地面推理失败）时，额外给出相机锚定回退块
-        if want_mesh and (world is None or world.get("status") != "ok"):
-            cam_block = _pose_camera_space_block(state, raw, internal.get("keypoints_3d_cam"))
-            if cam_block is not None:
-                body["camera_space"] = cam_block
+    body["request_id"] = rid
+    body["time_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    body.update(_pose_target_fields(target))
 
-        if want_overlay:
-            overlay = _pose_overlay_b64(
-                adapter,
-                rgb,
-                body.get("keypoints_2d_coco17"),
-                world=world,
-                camera=body.get("camera"),
-            )
-            if overlay:
-                body["overlay_jpeg_b64"] = overlay
-            else:
-                body["overlay_error"] = "overlay 生成失败"
+    diagnostics = body.get("retarget_diagnostics") or {}
+    info = queue_info or {}
+    logger.info(
+        "pose request_id=%s sam3d=%s upscale=%s target_status=%s fingerprint=%s schema=%s "
+        "mapped=%s det_ok=%s unconverged=%s world.source=%s world.status=%s time_ms=%s "
+        "wait_ms=%s exec_ms=%s pending_at_start=%s",
+        rid,
+        body.get("sam3d_inference_type"),
+        body.get("sam3d_upscale"),
+        body.get("target_status"),
+        body.get("target_fingerprint"),
+        body.get("retarget_schema"),
+        diagnostics.get("mapped_count"),
+        diagnostics.get("det_ok"),
+        diagnostics.get("unconverged_chains"),
+        (world or {}).get("source"),
+        (world or {}).get("status"),
+        body.get("time_ms"),
+        info.get("wait_ms"),
+        round((time.perf_counter() - exec_started) * 1000.0, 1),
+        info.get("pending_at_start"),
+    )
+    return 200, body
 
-        body["request_id"] = rid
-        body["time_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
-        body.update(_pose_target_fields(target))
 
-        diagnostics = body.get("retarget_diagnostics") or {}
-        logger.info(
-            "pose request_id=%s sam3d=%s upscale=%s target_status=%s fingerprint=%s schema=%s "
-            "mapped=%s det_ok=%s unconverged=%s world.source=%s world.status=%s time_ms=%s",
-            rid,
-            body.get("sam3d_inference_type"),
-            body.get("sam3d_upscale"),
-            body.get("target_status"),
-            body.get("target_fingerprint"),
-            body.get("retarget_schema"),
-            diagnostics.get("mapped_count"),
-            diagnostics.get("det_ok"),
-            diagnostics.get("unconverged_chains"),
-            (world or {}).get("source"),
-            (world or {}).get("status"),
-            body.get("time_ms"),
+def _pose_queue_reject_message(reason: str, snapshot: Dict[str, Any], *, limit: int = 0) -> str:
+    """队列拒绝原因 -> 客户端可读的 ``error`` 文本（形如 ``queue_full: …``）。"""
+    template = _POSE_QUEUE_ERROR_MESSAGES.get(reason)
+    if not template:
+        return reason
+    if reason == "queue_full":
+        detail = template.format(
+            pending=int(snapshot.get("pending") or 0),
+            capacity=int(snapshot.get("capacity") or 0),
         )
-        return 200, body
-    finally:
-        state["pose_tasks"].pop(rid, None)
-        lock.release()
+    elif reason == "client_quota":
+        detail = template.format(limit=limit)
+    else:
+        detail = template
+    return f"{reason}: {detail}"
+
+
+def _pose_single_pipeline(
+    state: Dict[str, Any],
+    data: Dict[str, Any],
+    *,
+    upload: Optional[bytes] = None,
+    client_key: str = "unknown",
+    priority: int = PRIORITY_INTERACTIVE,
+    queue_timeout_s: Optional[float] = None,
+) -> Tuple[int, Dict[str, Any], Dict[str, str]]:
+    """HTTP 线程侧：prepare -> 入队 -> 等待 -> 拼 ``queue`` 字段。
+
+    返回 ``(http_code, body, headers)``；``headers`` 目前只用于 ``Retry-After``。
+    """
+    prepared, error = _pose_prepare(state, data, upload=upload)
+    if error is not None:
+        code, body = error
+        return code, body, {}
+
+    rid = str(prepared["request_id"])
+    queue: Optional[PoseQueue] = state.get("pose_queue")
+    if queue is None:
+        return (
+            503,
+            _pose_error_body(
+                "队列未初始化（服务未就绪）", request_id=rid, error_code="queue_unavailable"
+            ),
+            {},
+        )
+
+    payload = {"kind": "pose", "prepared": prepared}
+    try:
+        job = queue.submit(
+            request_id=rid, client_key=client_key, priority=priority, payload=payload
+        )
+    except QueueRejected as exc:
+        retry_after = _POSE_QUEUE_RETRY_AFTER.get(exc.reason, 2)
+        body = _pose_error_body(
+            _pose_queue_reject_message(exc.reason, exc.snapshot, limit=queue.per_client_limit),
+            request_id=rid,
+            error_code=exc.reason,
+            queue=_pose_queue_summary(exc.snapshot),
+            retry_after_s=retry_after,
+        )
+        return 503, body, {"Retry-After": str(retry_after)}
+
+    try:
+        result = queue.wait(job, timeout_s=queue_timeout_s)
+    except QueueTimeout as exc:
+        retry_after = _POSE_QUEUE_RETRY_AFTER["queue_timeout"]
+        body = _pose_error_body(
+            f"queue_timeout: 排队超时（等待 {exc.waited_ms:.0f} ms，"
+            f"上限 {queue.wait_timeout_s:.0f}s），请稍后重试",
+            request_id=rid,
+            error_code="queue_timeout",
+            queue=_pose_queue_summary(exc.snapshot),
+            retry_after_s=retry_after,
+        )
+        return 503, body, {"Retry-After": str(retry_after)}
+
+    if result is None:
+        # pending 阶段被取消：worker 未执行，等待线程立即返回
+        return 200, _pose_cancelled_body(rid, queue=_pose_queue_info(job)), {}
+
+    code, body = result
+    if isinstance(body, dict) and (
+        body.get("status") == "cancelled" or (code == 200 and body.get("status") != "error")
+    ):
+        body["queue"] = _pose_queue_info(job)
+    return code, body, {}
+
+
+def _pose_ground_execute(
+    state: Dict[str, Any],
+    payload: Dict[str, Any],
+    cancel: threading.Event,
+) -> Tuple[int, Dict[str, Any]]:
+    """worker 线程内执行 ``/v1/ground`` 的姿势分支（与设备共享同一 GPU）。"""
+    started = time.perf_counter()
+    estimator = state.get("pose_estimator")
+    if estimator is None:
+        return 200, {
+            "status": "error",
+            "engine": "sam3d_body_vith",
+            "error": "SAM3D 未启用或未能加载；请配置 SAM3D_RESOURCES 并检查启动日志",
+        }
+    if cancel.is_set():
+        return 200, {"status": "cancelled", "engine": "sam3d_body_vith", "error": "任务已取消"}
+    try:
+        pose = estimator.infer(
+            payload["rgb"],
+            payload["person_mask"],
+            want_overlay=bool(payload.get("want_overlay")),
+            want_mesh=bool(payload.get("want_mesh")),
+            cam_int=payload.get("cam_int"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("SAM3D 姿势推理失败")
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            torch.cuda.empty_cache()
+        return 200, {
+            "status": "error",
+            "engine": "sam3d_body_vith",
+            "error": f"{type(exc).__name__}: {exc}",
+            "time_ms": round((time.perf_counter() - started) * 1000.0, 1),
+        }
+    pose["time_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    return 200, pose
+
+
+def _pose_queue_executor(state: Dict[str, Any]):
+    """队列 executor：按 payload.kind 分派到姿势接口或 ``/v1/ground`` 分支。"""
+
+    def executor(job: PoseJob) -> Tuple[int, Dict[str, Any]]:
+        payload = job.payload or {}
+        if payload.get("kind") == "ground_pose":
+            return _pose_ground_execute(state, payload, job.cancel)
+        info = _pose_queue_info(job)
+        return _pose_execute(state, payload.get("prepared") or {}, job.cancel, queue_info=info)
+
+    return executor
+
+
+def _pose_ground_infer(
+    state: Dict[str, Any],
+    *,
+    rgb: np.ndarray,
+    person_mask: np.ndarray,
+    want_overlay: bool,
+    want_mesh: bool,
+    cam_int: Optional[np.ndarray],
+    client_key: str,
+) -> Dict[str, Any]:
+    """``/v1/ground`` 的姿势分支：低优先级入队等待，失败只降级 ``pose``。"""
+    queue: Optional[PoseQueue] = state.get("pose_queue")
+    if queue is None:
+        return {
+            "status": "error",
+            "engine": "sam3d_body_vith",
+            "error_code": "queue_unavailable",
+            "error": "姿势队列未初始化（服务未就绪）",
+        }
+    request_id = uuid.uuid4().hex
+    payload = {
+        "kind": "ground_pose",
+        "rgb": rgb,
+        "person_mask": person_mask,
+        "want_overlay": want_overlay,
+        "want_mesh": want_mesh,
+        "cam_int": cam_int,
+    }
+    try:
+        job = queue.submit(
+            request_id=request_id, client_key=client_key, priority=PRIORITY_GROUND, payload=payload
+        )
+    except QueueRejected as exc:
+        return {
+            "status": "error",
+            "engine": "sam3d_body_vith",
+            "error_code": exc.reason,
+            "error": _pose_queue_reject_message(exc.reason, exc.snapshot, limit=queue.per_client_limit),
+        }
+    try:
+        result = queue.wait(job)
+    except QueueTimeout as exc:
+        return {
+            "status": "error",
+            "engine": "sam3d_body_vith",
+            "error_code": "queue_timeout",
+            "error": f"排队超时（等待 {exc.waited_ms:.0f} ms），请稍后重试",
+            "time_ms": round(exc.waited_ms, 1),
+        }
+    if result is None:
+        return {"status": "cancelled", "engine": "sam3d_body_vith", "error": "任务已取消"}
+    return result[1]
 
 
 def create_ground_app(
@@ -2310,7 +2642,20 @@ def create_ground_app(
     floor_prompt: str = DEFAULT_FLOOR_PROMPT,
     person_prompt: str = "person.",
     sam3d_resources: Optional[str | Path] = None,
+    pose_queue_size: int = 16,
+    pose_queue_timeout: float = 60.0,
+    pose_queue_per_client: int = 4,
+    pose_queue_aging: float = 30.0,
+    pose_queue_exec_timeout: float = 300.0,
+    pose_metrics_client_label: bool = True,
 ) -> FastAPI:
+    pose_queue = PoseQueue(
+        capacity=pose_queue_size,
+        per_client_limit=pose_queue_per_client,
+        wait_timeout_s=pose_queue_timeout,
+        aging_s=pose_queue_aging,
+        exec_timeout_s=pose_queue_exec_timeout,
+    )
     state: Dict[str, Any] = {
         "segmenter": None,
         "depth": None,
@@ -2319,8 +2664,8 @@ def create_ground_app(
         "pose_estimator": None,
         "pose_error": "",
         "retarget": None,
-        "pose_lock": threading.Lock(),
-        "pose_tasks": {},
+        "pose_queue": pose_queue,
+        "pose_metrics_client_label": bool(pose_metrics_client_label),
         "floor_prompt": floor_prompt,
         "person_prompt": person_prompt,
     }
@@ -2370,9 +2715,11 @@ def create_ground_app(
                 logger.exception("姿势重定向适配层加载失败；/v1|v2/pose/* 返回 503")
         else:
             logger.info("未配置 SAM3D_RESOURCES，姿势模块保持禁用")
+        pose_queue.start(_pose_queue_executor(state))
         logger.info("服务就绪")
         yield
         logger.info("关闭服务")
+        pose_queue.shutdown()
 
     app = FastAPI(
         title="ground_pipeline Ground-plane API",
@@ -2414,7 +2761,7 @@ def create_ground_app(
         }
 
     @app.post("/v1/ground", response_model=GroundResult)
-    async def ground(request: GroundRequest):
+    async def ground(request: GroundRequest, http: Request):
         if state["segmenter"] is None or state["depth"] is None:
             raise HTTPException(status_code=503, detail="模型未就绪（可能加载失败），请检查服务日志")
 
@@ -2482,26 +2829,19 @@ def create_ground_app(
             elif state["pose_estimator"] is None:
                 pose = {"status": "error", "engine": "sam3d_body_vith", "error": "SAM3D 未启用或未能加载；请配置 SAM3D_RESOURCES 并检查启动日志"}
             else:
-                pose_started = time.perf_counter()
-                try:
-                    pose = state["pose_estimator"].infer(
-                        rgb,
-                        person_mask,
-                        want_overlay=bool(request.visualize and request.pose_want_overlay),
-                        want_mesh=bool(request.visualize and request.pose_want_mesh),
-                        cam_int=intrinsics,
-                    )
-                    pose["time_ms"] = round((time.perf_counter() - pose_started) * 1000.0, 1)
-                except Exception as e:
-                    logger.exception("SAM3D 姿势推理失败")
-                    if isinstance(e, torch.cuda.OutOfMemoryError):
-                        torch.cuda.empty_cache()
-                    pose = {
-                        "status": "error",
-                        "engine": "sam3d_body_vith",
-                        "error": f"{type(e).__name__}: {e}",
-                        "time_ms": round((time.perf_counter() - pose_started) * 1000.0, 1),
-                    }
+                from starlette.concurrency import run_in_threadpool
+
+                # 与 /v1|v2/pose/* 共用队列（内部低优先级 5）；拒绝/超时只降级 pose
+                pose = await run_in_threadpool(
+                    _pose_ground_infer,
+                    state,
+                    rgb=rgb,
+                    person_mask=person_mask,
+                    want_overlay=bool(request.visualize and request.pose_want_overlay),
+                    want_mesh=bool(request.visualize and request.pose_want_mesh),
+                    cam_int=intrinsics,
+                    client_key=_pose_client_key({}, http),
+                )
 
         # 人物 3D 点云 bbox（相机坐标系轴对齐）：取人物 mask 中有效反投影点的 x/y/z min/max。
         person_bbox_3d_m = None
@@ -2881,23 +3221,46 @@ def create_ground_app(
                     media_type="application/json; charset=utf-8",
                 )
 
-        def emit(code: int, body: Dict[str, Any]) -> Response:
+        def emit(
+            code: int, body: Dict[str, Any], headers: Optional[Dict[str, str]] = None
+        ) -> Response:
             if v2 and serializer is not None:
-                content, media = serializer.serialize_v2_response(body, response_format=fmt)
+                # v2 XML 结构保持不变：队列信息只走 JSON 路径
+                payload = body
+                if fmt == "xml" and isinstance(body, dict):
+                    stripped = {"queue", "error_code", "retry_after_s"}
+                    if stripped & set(body):
+                        payload = {k: v for k, v in body.items() if k not in stripped}
+                content, media = serializer.serialize_v2_response(payload, response_format=fmt)
                 if fmt == "xml":
-                    content = insert_gravity_xml_metadata(content, body)
-                if fmt == "xml" and isinstance(body.get("world"), dict):
-                    content = insert_world_xml(content.decode("utf-8"), body["world"]).encode("utf-8")
+                    content = insert_gravity_xml_metadata(content, payload)
+                if fmt == "xml" and isinstance(payload.get("world"), dict):
+                    content = insert_world_xml(content.decode("utf-8"), payload["world"]).encode("utf-8")
                     media = "application/xml; charset=utf-8"
-                return Response(content, status_code=code, media_type=media)
+                return Response(content, status_code=code, media_type=media, headers=headers)
             return Response(
                 _pose_json_bytes(body),
                 status_code=code,
                 media_type="application/json; charset=utf-8",
+                headers=headers,
             )
 
-        code, body = await run_in_threadpool(_pose_single_pipeline, state, data, upload=upload)
-        return emit(code, body)
+        client_key = _pose_client_key(data, request)
+        try:
+            queue_timeout_s = float(data.get("queue_timeout_s"))
+        except (TypeError, ValueError):
+            queue_timeout_s = None
+        if queue_timeout_s is not None and queue_timeout_s <= 0:
+            queue_timeout_s = None
+        code, body, headers = await run_in_threadpool(
+            _pose_single_pipeline,
+            state,
+            data,
+            upload=upload,
+            client_key=client_key,
+            queue_timeout_s=queue_timeout_s,
+        )
+        return emit(code, body, headers)
 
     async def _pose_cancel(request: Request, v2: bool) -> Response:
         content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
@@ -2921,8 +3284,9 @@ def create_ground_app(
             )
 
         rid = str(payload.get("request_id") or "").strip()
-        event = state["pose_tasks"].get(rid) if rid else None
-        if event is None:
+        queue: Optional[PoseQueue] = state.get("pose_queue")
+        info = queue.cancel(rid) if queue is not None else {"found": False, "state": "", "ahead": 0}
+        if not info.get("found"):
             body = {"request_id": rid, "cancelled": False, "error": "未找到任务"}
             if v2 and "json" not in content_type:
                 return Response(
@@ -2931,8 +3295,10 @@ def create_ground_app(
             return Response(
                 _pose_json_bytes(body), status_code=404, media_type="application/json; charset=utf-8"
             )
-        event.set()
         body = {"request_id": rid, "cancelled": True}
+        if info.get("state"):
+            body["state"] = info["state"]
+            body["ahead"] = int(info.get("ahead") or 0)
         if v2 and "json" not in content_type:
             return Response(
                 _pose_cancel_xml(body), status_code=200, media_type="application/xml; charset=utf-8"
@@ -2974,6 +3340,24 @@ def create_ground_app(
     async def pose_cancel_v2(request: Request):
         return await _pose_cancel(request, True)
 
+    @app.get("/v1/pose/queue")
+    async def pose_queue_state():
+        """只读队列快照（排障与客户端自适应）。"""
+        snapshot = pose_queue.snapshot()
+        snapshot["worker_alive"] = pose_queue.worker_alive
+        snapshot["version"] = POSE_API_VERSION
+        return snapshot
+
+    @app.get("/metrics")
+    async def metrics():
+        """Prometheus 文本格式（手写，不依赖 prometheus_client）。"""
+        return Response(
+            pose_queue.render_prometheus(
+                client_label=bool(state.get("pose_metrics_client_label"))
+            ),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
     return app
 
 
@@ -2989,6 +3373,43 @@ if __name__ == "__main__":
     parser.add_argument("--floor-prompt", type=str, default=DEFAULT_FLOOR_PROMPT, help="默认地面分割提示词")
     parser.add_argument("--person-prompt", type=str, default="person.", help="默认人物分割提示词；传空串禁用接触区域检测")
     parser.add_argument("--sam3d-resources", type=str, default=os.environ.get("SAM3D_RESOURCES"), help="ImagePose_Resources 根目录；配置后加载 SAM3D Body（不加载 ViTPose）")
+    parser.add_argument(
+        "--pose-queue-size",
+        type=int,
+        default=int(os.environ.get("POSEEXTRACTOR_POSE_QUEUE_SIZE", "16")),
+        help="姿势队列等待位容量；0 表示禁用排队（忙时立即 503，回滚用）",
+    )
+    parser.add_argument(
+        "--pose-queue-timeout",
+        type=float,
+        default=float(os.environ.get("POSEEXTRACTOR_POSE_QUEUE_TIMEOUT", "60")),
+        help="排队等待上限（秒），与客户端 HTTP 超时对齐",
+    )
+    parser.add_argument(
+        "--pose-queue-per-client",
+        type=int,
+        default=int(os.environ.get("POSEEXTRACTOR_POSE_QUEUE_PER_CLIENT", "4")),
+        help="单客户端 pending+running 上限",
+    )
+    parser.add_argument(
+        "--pose-queue-aging",
+        type=float,
+        default=float(os.environ.get("POSEEXTRACTOR_POSE_QUEUE_AGING", "30")),
+        help="低优先级任务等待多久提升一级有效优先级（秒）；0 关闭 aging",
+    )
+    parser.add_argument(
+        "--pose-queue-exec-timeout",
+        type=float,
+        default=float(os.environ.get("POSEEXTRACTOR_POSE_QUEUE_EXEC_TIMEOUT", "300")),
+        help="单次执行告警阈值（秒），只告警不中断",
+    )
+    parser.add_argument(
+        "--pose-metrics-client-label",
+        type=int,
+        choices=(0, 1),
+        default=int(os.environ.get("POSEEXTRACTOR_POSE_METRICS_CLIENT_LABEL", "1")),
+        help="/metrics 是否输出 client 标签；0 关闭以降低基数",
+    )
 
     args = parser.parse_args()
     app = create_ground_app(
@@ -2998,6 +3419,12 @@ if __name__ == "__main__":
         floor_prompt=args.floor_prompt,
         person_prompt=args.person_prompt,
         sam3d_resources=args.sam3d_resources,
+        pose_queue_size=args.pose_queue_size,
+        pose_queue_timeout=args.pose_queue_timeout,
+        pose_queue_per_client=args.pose_queue_per_client,
+        pose_queue_aging=args.pose_queue_aging,
+        pose_queue_exec_timeout=args.pose_queue_exec_timeout,
+        pose_metrics_client_label=bool(args.pose_metrics_client_label),
     )
     logger.info("启动 ground_pipeline 服务 %s:%s", args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port)
