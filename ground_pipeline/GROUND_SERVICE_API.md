@@ -396,6 +396,7 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 | `keypoints_3d_coco17` | 默认 SAM-3D 模型系；`keypoints_3d_coco17_frame=figure_v6` 时为 `figure_v6` | 米 |
 | `cs.pose_payload` / `cs.bip22_payload` 的位置行、`cs.points_53`、`cs.points_53_tsv` | `figure_v6` | 厘米 |
 | `cs.pose_payload.data[6][0]`（相机中心）、`cs.pose_payload.data[6][1]`（`torso_length`） | `figure_v6` | 米 |
+| `<csPose><camera>/<targetPose><camera>` 的 `center` / `torso_length` | `figure_v6`（`center` 为骨盆→相机的相对向量） | 米 |
 | `world.*` 位置、`world.ground_snap.offset_m`、`world.min_z_m`、`camera_space.*` 位置 | `ground_world_v1` / `camera_v1` | 米 |
 | `camera.*`、`camera_space.pred_cam_t` | 相机系 | 米 |
 | 旋转矩阵 / `global_rotation` / `local_rotation`；`bip22_facing`、头轴、足法线、胸向右、手轴等方向向量 | 随所属块 | 无单位（只换基、不平移） |
@@ -411,7 +412,7 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 
 - **触发**：`run_ground = want_world || align_gravity` 决定是否解析/推理地面；`align_gravity=true` 且地面变换可用时执行对齐。
 - **旋转**：把地面 up 方向在 Figure 系中的表示 `u_fig = FIGURE_P @ Rᵀ @ e_z` 旋到 `(0,0,1)`，得到真旋转 `S`（Rodrigues，`det=+1`）；`align_angle_deg = acos(u_fig_z)`。
-- **作用范围**：`joints_3d`、`keypoints_3d_coco17`（先由模型系换基到 `figure_v6`，再随其余 `figure_v6` 字段一起绕骨盆支点旋转）、`generic_pose`（位置绕骨盆支点旋转、`pred_global_rots` 左乘 `S`、`global_rot` 欧拉角同步）、`retarget`（每骨 `global_rotation` 左乘 `S`、`position` 绕骨盆旋转）、`cs`（`bip22_joints` 等米制字段绕 `bip22_joints[1]` 支点旋转，`pose_payload` / `points_53` 等厘米字段按同一支点换算，仅旋转不缩放；`pose_payload.data[6][0]` 相机中心按**米**绕顶层骨盆支点旋转并随 `dz` 落地，`data[6][1]` 的 `torso_length` 保持不变）；`camera` 块恒为相机系，不参与对齐。
+- **作用范围**：`joints_3d`、`keypoints_3d_coco17`（先由模型系换基到 `figure_v6`，再随其余 `figure_v6` 字段一起绕骨盆支点旋转）、`generic_pose`（位置绕骨盆支点旋转、`pred_global_rots` 左乘 `S`、`global_rot` 欧拉角同步）、`retarget`（每骨 `global_rotation` 左乘 `S`、`position` 绕骨盆旋转）、`cs`（`bip22_joints` 等米制字段绕 `bip22_joints[1]` 支点旋转，`pose_payload` / `points_53` 等厘米字段按同一支点换算，仅旋转不缩放；`pose_payload.data[6][0]` 相机中心是「骨盆→相机」的相对向量，只做 `center' = S·center`（相机随姿势刚性旋转），**不**绕骨盆支点平移、**不**叠加落地 `dz`，`data[6][1]` 的 `torso_length` 保持不变）；`camera` 块恒为相机系，不参与对齐。
 - **落地**：对齐后在 mesh 顶点（缺网格时回退 joints / keypoints）上采样最低 `z`，统一取 `dz = -min_z`，所有位置 `z += dz`；`Bip001 root` 恒置 `z=0`。落地只做平移，不改旋转与朝向。
 - **幂等**：对同一 payload 重复调用会报 `gravity alignment already applied`，不会二次旋转。
 - **元数据**：顶层 `gravity_aligned` / `align_angle_deg` / `gravity_alignment`；`cs`（含 `cs.pose_payload`）与 `retarget` 镜像同名两项。
@@ -472,6 +473,8 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 `POST /v2/pose/single` 默认返回 `application/xml`：`<poseResponse api_version="3">` 内含 `<poseResult>`（状态、关节、重定向骨、`<restProfile>` 等）、`<csPose>`（`figure_v6` 数值、厘米；例外：`<camera torso_length=... fov=... aspect=...>` 与 `<center x y z>` 为米，与 CS 序列化器一致）与 `<targetPose>`（`frame="figure_v6"`），并在根节点末尾（`</poseResponse>` 之前）插入本项目扩展的 `<worldPose>`（`ground_world_v1`，仅 `want_world=true` 且地面可用）。
 
 重力对齐元数据以**属性**形式统一写在 `poseResult` / `csPose` / `targetPose` 三个节点上，不新增子节点：`gravity_aligned="true|false"`；角度有限时附 `align_angle_deg="12.860000"`，为 `null` 时省略该属性。
+
+`<targetPose>` 在 `<root>` 之后、`<bones>` 之前带一个 `<camera torso_length="米" fov="度" aspect="无量纲"><center x y z/></camera>`，字段语义与 `<csPose><camera>` **完全一致**：`center` 是「骨盆→相机」的相对向量（`figure_v6`、米），`torso_length` 为该视角下躯干长度（米）。无相机槽时写 `<camera null="true"/>`。这样只消费 `targetPose` 的通道也能匹配图片视角；`align_gravity=true` 时它随 `<csPose><camera>` 一同按 `center' = S·center` 旋转，不含落地 `dz`。
 
 ```xml
 <?xml version='1.0' encoding='utf-8'?>
