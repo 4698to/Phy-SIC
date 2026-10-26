@@ -746,8 +746,9 @@ def apply_gravity_alignment(
                 if len(rows) > 5 and isinstance(rows[5], list):
                     rows[5] = [None if hand is None else [cs_direction(v) for v in hand] for hand in rows[5]]
                 if len(rows) > 6 and isinstance(rows[6], list) and rows[6] and rows[6][0] is not None:
-                    center_m = np.asarray(rows[6][0], dtype=np.float64)
-                    center = (rotation @ (center_m - pivot) + pivot).tolist()
+                    # 相机 center 是“骨盆→相机”的相对向量（figure 系、米），随姿势整体旋转；
+                    # 它不是绝对位置，不能绕 pivot 旋转，落地平移也不参与。
+                    center = (rotation @ np.asarray(rows[6][0], dtype=np.float64)).tolist()
                     rows[6] = [center, *rows[6][1:]]
             payload["data"] = rows
             payload["frame"] = FRAME_FIGURE
@@ -861,10 +862,7 @@ def apply_gravity_alignment(
                 if len(arr):
                     arr[0, 2] = 0.0
                 rows[0] = arr.tolist()
-            if payload_key == "pose_payload" and len(rows) > 6 and isinstance(rows[6], list) and rows[6] and rows[6][0] is not None:
-                center = np.asarray(rows[6][0], dtype=np.float64)
-                center[2] += dz
-                rows[6] = [center.tolist(), *rows[6][1:]]
+            # 相机 center 是相对骨盆的向量：骨盆与相机一起落地平移，相对量保持不变。
             payload["data"] = rows
             cs[payload_key] = payload
         if isinstance(cs.get("pose_payload"), dict):

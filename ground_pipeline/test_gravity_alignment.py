@@ -373,16 +373,16 @@ class GravityAlignmentTest(unittest.TestCase):
         )
         rotation, _ = alignment_rotation(transform)
         body = _base_body()
-        pivot = np.asarray(body["joints_3d"][0], dtype=np.float64)
-        center = pivot + np.array([0.30, -0.20, 0.40])
+        # center 是“骨盆→相机”的相对向量（figure 系、米），不是绝对相机位置
+        center = np.array([0.30, -0.20, 0.40])
         body["cs"]["pose_payload"]["data"][6] = [center.tolist(), 0.5, 60.0, 1.0]
 
         report = apply_gravity_alignment(body, transform)
         dz = report["dz_m"]
+        self.assertNotAlmostEqual(dz, 0.0, places=6)
         slot = body["cs"]["pose_payload"]["data"][6]
-        expected = rotation @ (center - pivot) + pivot
-        expected[2] += dz
-        np.testing.assert_allclose(slot[0], expected, atol=1e-6)
+        # 相机与姿势刚性旋转：相对向量只旋转，不绕骨盆平移，也不叠加落地 dz
+        np.testing.assert_allclose(slot[0], rotation @ center, atol=1e-6)
         # 相机中心是米制：与 pivot 同量级，不能被放大 100 倍
         self.assertLess(float(np.max(np.abs(slot[0]))), 10.0)
         self.assertEqual(slot[1:], [0.5, 60.0, 1.0])
