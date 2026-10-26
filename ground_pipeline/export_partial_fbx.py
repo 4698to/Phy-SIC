@@ -54,13 +54,6 @@ for collection in list(bpy.data.collections):
 scene = bpy.context.scene
 scene.unit_settings.system = "METRIC"
 
-# Keep the exact API point arrays in the original camera coordinate system.
-plane_raw = new_vertices_object("API_plane_points_camera_xyz", data["plane_points"])
-inliers_raw = new_vertices_object("API_inlier_points_camera_xyz", data["inlier_points"])
-person_raw = None
-if data.get("person_points"):
-    person_raw = new_vertices_object("API_person_points_camera_xyz", data["person_points"])
-
 # Ground plane surface transformed to the ground-aligned local world frame.
 steps = int(round(math.sqrt(len(data["plane_points"]))))
 if steps * steps != len(data["plane_points"]):
@@ -82,9 +75,9 @@ cloud = new_vertices_object("Ground_Inlier_Samples_Display", [to_world(p) for p 
 
 # Display returned person samples as a lightweight vertex cloud in the ground-aligned frame.
 person_display = None
-if person_raw is not None:
+if data.get("person_points"):
     full_person_points = data["person_points"]
-    display_limit = 20000
+    display_limit = 2000
     stride = max(1, math.ceil(len(full_person_points) / display_limit))
     display_points = full_person_points[::stride][:display_limit]
     person_display = new_vertices_object("Person_PointCloud_Display_Sampled", [to_world(p) for p in display_points])
@@ -142,7 +135,7 @@ if bbox_values is not None:
 # Preserve API scalar/array fields as FBX custom properties, excluding point arrays represented above.
 metadata = bpy.data.objects.new("API_Response_Metadata", None)
 scene.collection.objects.link(metadata)
-metadata["coordinate_note"] = "Raw API point objects are in camera xyz; ground mesh is ground-aligned local world xyz."
+metadata["coordinate_note"] = "Displayed point clouds and ground geometry are transformed to ground-aligned local world xyz."
 for key, value in data.items():
     if key in {"plane_points", "inlier_points", "person_points", "masks", "depth_b64", "visualization"}:
         continue
@@ -153,8 +146,6 @@ if data.get("depth_b64"):
     depth_path = output_path.with_name(output_path.stem + "_depth.npy")
     depth_path.write_bytes(base64.b64decode(data["depth_b64"]))
     metadata["depth_npy_filename"] = depth_path.name
-    depth_text = bpy.data.texts.new("API_depth_b64_npy")
-    depth_text.write(data["depth_b64"])
 
 # Embed API visualization and segmentation masks as textured image cards.
 image_cards = []
@@ -208,7 +199,7 @@ for index, (key, uri) in enumerate(image_items):
 # Export selected asset objects and custom properties; packed texture files are embedded.
 for obj in bpy.context.selected_objects:
     obj.select_set(False)
-export_objects = [plane_raw, inliers_raw, *([person_raw] if person_raw else []), ground, cloud, *([person_display] if person_display else []), camera, metadata, *person_objects, *image_cards]
+export_objects = [ground, cloud, *([person_display] if person_display else []), camera, metadata, *person_objects, *image_cards]
 for obj in export_objects:
     obj.select_set(True)
 bpy.context.view_layer.objects.active = ground
