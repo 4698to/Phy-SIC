@@ -2253,6 +2253,8 @@ def _pose_single_pipeline(
             mesh_vertices=raw.get("pred_vertices"),
         )
         body["bbox_source"] = bbox_source
+        body["sam3d_inference_type"] = pose.get("sam3d_inference_type")
+        body["sam3d_upscale"] = pose.get("sam3d_upscale")
 
         # 无可靠世界系（want_world=false 或地面推理失败）时，额外给出相机锚定回退块
         if want_mesh and (world is None or world.get("status") != "ok"):
@@ -2279,9 +2281,11 @@ def _pose_single_pipeline(
 
         diagnostics = body.get("retarget_diagnostics") or {}
         logger.info(
-            "pose request_id=%s target_status=%s fingerprint=%s schema=%s mapped=%s det_ok=%s "
-            "unconverged=%s world.source=%s world.status=%s time_ms=%s",
+            "pose request_id=%s sam3d=%s upscale=%s target_status=%s fingerprint=%s schema=%s "
+            "mapped=%s det_ok=%s unconverged=%s world.source=%s world.status=%s time_ms=%s",
             rid,
+            body.get("sam3d_inference_type"),
+            body.get("sam3d_upscale"),
             body.get("target_status"),
             body.get("target_fingerprint"),
             body.get("retarget_schema"),

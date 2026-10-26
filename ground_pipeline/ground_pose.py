@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import sys
 import threading
 from pathlib import Path
@@ -121,6 +122,29 @@ def _pose_mesh_data_uri(vertices: np.ndarray, faces: np.ndarray) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+# SAM3D 推理类型（与环境变量语义保持一致，见 ai_vitpose/core/sam3d_adapter.py）：
+#   full（默认）= 身体解码 + 左右手解码，finger 关节不再是 T-pose，重定向手指链才有数据；
+#   body        = 仅身体解码（旧行为），手指停在 T-pose。
+SAM3D_INFERENCE_ENV = "POSEEXTRACTOR_SAM3D_INFERENCE"
+
+
+def sam3d_inference_type() -> str:
+    value = os.environ.get(SAM3D_INFERENCE_ENV, "").strip().lower()
+    return "body" if value == "body" else "full"
+
+
+# 推理前放大系数（1–3）。手部 crop 固定 512×512，放大原图可让手部从更多原始像素采样。
+SAM3D_UPSCALE_ENV = "POSEEXTRACTOR_SAM3D_UPSCALE"
+
+
+def sam3d_upscale() -> float:
+    try:
+        value = float(os.environ.get(SAM3D_UPSCALE_ENV, "1") or 1.0)
+    except ValueError:
+        value = 1.0
+    return min(max(value, 1.0), 3.0)
+
+
 RAW_POSE_FIELDS = (
     "pred_joint_coords",
     "mhr_joint_coords",
@@ -134,6 +158,9 @@ RAW_POSE_FIELDS = (
     "focal_length",
     "scale_params",
     "shape_params",
+    # inference_type="full" 才有：手部解码实际使用的左右手框（原图像素坐标）
+    "lhand_bbox",
+    "rhand_bbox",
 )
 
 
@@ -224,21 +251,52 @@ class GroundPoseEstimator:
             bbox = np.asarray(bbox, dtype=np.float32).reshape(1, 4)
         height, width = rgb.shape[:2]
 
+        mode = sam3d_inference_type()
+        scale = sam3d_upscale()
+        source = rgb
+        model_bbox = bbox
+        model_cam_int = cam_int
+        if scale > 1.001:
+            import cv2
+
+            source = cv2.resize(
+                np.ascontiguousarray(rgb), None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+            )
+            model_bbox = bbox * scale
+            if cam_int is not None:
+                model_cam_int = np.array(cam_int, dtype=np.float32, copy=True)
+                model_cam_int[0, :] *= scale
+                model_cam_int[1, :] *= scale
+
         with self._lock, torch.inference_mode():
             outputs = self.estimator.process_one_image(
-                rgb,
-                bboxes=bbox,
+                source,
+                bboxes=model_bbox,
                 use_mask=False,
                 cam_int=(
-                    torch.as_tensor(cam_int, dtype=torch.float32).unsqueeze(0)
-                    if cam_int is not None else None
+                    torch.as_tensor(model_cam_int, dtype=torch.float32).unsqueeze(0)
+                    if model_cam_int is not None else None
                 ),
-                inference_type="body",
+                inference_type=mode,
             )
         if not outputs:
             raise RuntimeError("SAM3D did not return a body pose")
 
         person = outputs[0]
+        if scale > 1.001:
+            # 放大只用于推理；2D 关键点与焦距要还原到原图像素坐标，3D/平移不受影响。
+            person = dict(person)
+            if person.get("pred_keypoints_2d") is not None:
+                person["pred_keypoints_2d"] = (
+                    np.asarray(person["pred_keypoints_2d"], dtype=np.float32) / scale
+                )
+            if person.get("focal_length") is not None:
+                person["focal_length"] = (
+                    np.asarray(person["focal_length"], dtype=np.float32) / scale
+                )
+            for key in ("lhand_bbox", "rhand_bbox"):
+                if person.get(key) is not None:
+                    person[key] = np.asarray(person[key], dtype=np.float32) / scale
         from ai_vitpose.core.normalize import camera_points_to_figure_frame, skeleton24
 
         joints = camera_points_to_figure_frame(skeleton24(person["pred_joint_coords"]))
@@ -263,6 +321,8 @@ class GroundPoseEstimator:
             "orientation_mode": "fixed_camera_to_figure_v6",
             "bbox_2d_xyxy": bbox[0].tolist(),
             "camera": camera,
+            "sam3d_inference_type": mode,
+            "sam3d_upscale": scale,
         }
         if include_raw:
             raw: dict[str, Any] = {}
@@ -274,6 +334,8 @@ class GroundPoseEstimator:
                     raw[key] = _to_jsonable(value)
                 except Exception as exc:
                     raw[f"{key}_error"] = f"{type(exc).__name__}: {exc}"
+            raw["sam3d_inference_type"] = mode
+            raw["sam3d_upscale"] = scale
             result["raw"] = raw
         if want_overlay:
             try:

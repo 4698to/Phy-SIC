@@ -1594,6 +1594,9 @@ class RetargetAdapter:
                 "pred_cam_t": np.asarray(cam_t, dtype=np.float32).reshape(3).tolist(),
                 "scale_params": raw.get("scale_params"),
                 "shape_params": raw.get("shape_params"),
+                # inference_type=full 时 SAM3D 实际使用的手部框（原图像素坐标），用于排查手指是否生效
+                "lhand_bbox": raw.get("lhand_bbox"),
+                "rhand_bbox": raw.get("rhand_bbox"),
             }
 
         bip22_joints = (

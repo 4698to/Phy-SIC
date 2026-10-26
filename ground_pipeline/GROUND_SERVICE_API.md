@@ -143,6 +143,7 @@ curl -X POST http://127.0.0.1:8001/v1/ground \
 | `orientation_mode` | `fixed_camera_to_figure_v6` |
 | `bbox_2d_xyxy` | 人物 mask 派生并扩边裁剪后的图像像素坐标 `[x1,y1,x2,y2]` |
 | `camera` | SAM3D 相机估计及输入图像尺寸；`calibration` 表示模型默认 FOV，非实测标定 |
+| `sam3d_inference_type` / `sam3d_upscale` | SAM3D 实际推理模式（默认 `full`，含手部解码）与推理前放大系数；语义同 §3.3「手指支持」 |
 | `time_ms` | 请求内姿势推理耗时；姿势模型不可用或 mask 无效时不一定存在 |
 | `error` | `skipped` / `error` 时的简要原因 |
 | `overlay_error` | 可选；姿势推理成功但生成 2D 姿势叠加图失败时的错误摘要；`joints_3d` 仍有效 |
@@ -373,7 +374,8 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 | `generic_pose` | object | 参考同构的 127 关节载荷（`pred_joint_coords` / `pred_global_rots` / `global_rot` …），与 `joints_3d` 同属 `figure_v6`；重力对齐时位置按骨盆支点旋转、全局旋转左乘 `S` |
 | `bip22_joints` / `bip22_conf` / `bip22_source` / `bip22_height_m` / `bip22_facing` | - | CS 的 22 骨位置，`figure_v6` 系、米，`[0]` 为落地 root（`z=0`）；`bip22_facing` 为同系方向向量 |
 | `cs` | object | Character Studio 载荷（`pose_payload`、`points_53`、`bip22_payload` …），`figure_v6` 系；**块内单位不统一**：`pose_payload` / `bip22_payload` 的位置行、`points_53`、`points_53_tsv` 为**厘米**；`bip22_joints` / `bip22_facing` / `bip22_height_m` 为**米**，与顶层同名字段逐项一致；`pose_payload.data[6]` 为 `[center(米), torso_length(米), fov(度), aspect]`；方向类字段无单位。块本身不带 `frame` / `unit` 字段（与 CS 序列化器一致），单位按字段区分；`gravity_aligned` / `align_angle_deg` 与顶层同值 |
-| `retarget` | object \| null | 目标骨架重定向结果（`schema_version=bip22_pose_v5`，27 骨，`root` + `bones`，每骨 `global_rotation` / `local_rotation` / `position`）；`frame=figure_v6`、`position_space=figure_v6_world`；`gravity_aligned` / `align_angle_deg` 与顶层同值 |
+| `retarget` | object \| null | 目标骨架重定向结果（`schema_version=bip22_pose_v5`，v4 默认 53 骨（`root` + `bones`），含左右手 5 指链 `Bip001 L/R Finger0..4`；每骨 `global_rotation` / `local_rotation` / `position`）；`frame=figure_v6`、`position_space=figure_v6_world`；`gravity_aligned` / `align_angle_deg` 与顶层同值 |
+| `sam3d_inference_type` / `sam3d_upscale` | string / number | 本次 SAM3D 实际推理模式（`full` / `body`）与推理前放大系数；`full` 才包含手部解码，手指关节不再是 T-pose |
 | `retarget_status` / `retarget_schema` / `retarget_diagnostics` | - | 重定向状态、实际 schema（`auto` 实测解析为 `v4`）、映射诊断 |
 | `target_status` / `target_fingerprint` / `target_diagnostics` | - | `default`（内建 Biped）/ `provided` / `rejected` / `not_provided` |
 | `profile_rest` / `profile_rest_scope` | - | 目标骨架 rest 姿态（`scope=mapped`） |
@@ -385,6 +387,13 @@ curl -X POST http://127.0.0.1:8004/v2/pose/single \
 | `error` | string | 失败原因 |
 
 > 叠加图内容：`world.status=ok` 时先用 `world.rotation` / `world.plane_normal_camera` / `world.plane_d_camera` 与 `camera.focal_px` 把地平面网格投影到图像（橙色细线、55% 混合，网格与世界轴对齐并以世界原点对齐线段），再画 COCO-17 骨架；因此在同一张图里可直接核对骨架是否站在检测到的地面上。网格仅在 `want_world=true`（默认）且地面成功时绘制，`ground_mode=none` 或 `world.status=skipped/error` 时只返回骨架图。
+
+#### 手指支持（SAM3D `full` 推理）
+
+- 默认以 `inference_type="full"` 调用 SAM3D Body：身体解码后再对左右手 crop 单独解码，`generic_pose.pred_joint_coords` 的手指关节不再是 T-pose；v4 重定向的左右手 5 指 × 3 节链（`finger_L/R_Finger0..4`，绝对方向、按关节位置求解）因此有真实输入。
+- 回退旧行为：设置 `POSEEXTRACTOR_SAM3D_INFERENCE=body`（少两次手部解码，手指停在 T-pose），响应中 `sam3d_inference_type=body`。
+- 小图细节：`POSEEXTRACTOR_SAM3D_UPSCALE=1..3`（默认 `1`，推理前放大原图）；返回的 2D 关键点、手部框与 `camera.focal_px` 已还原到原图像素坐标。
+- 手部解码只在手腕角度与手框尺寸满足阈值时生效（手框需 >64px）；`want_raw=true` 时可用 `raw.lhand_bbox` / `raw.rhand_bbox` 核对手部框是否合理，`retarget_diagnostics.chains` 里 `finger_*` 链的 `converged` 可判断手指是否真的解出。
 
 #### 单位与坐标系约定
 
