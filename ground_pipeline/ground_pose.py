@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import base64
 import io
-import os
 import sys
 import threading
 from pathlib import Path
@@ -11,6 +10,35 @@ from typing import Any
 
 import numpy as np
 import torch
+
+# 推理服务配置（集中放在文件头部，不读取环境变量）。
+# True 使用通过贴合检查的 AFTER 姿势，False 保持原输出。
+SAM3D_OUTPUT_AFTER = False
+# full 包含身体和左右手；body 仅解码身体。
+SAM3D_INFERENCE_TYPE = "full"
+# 推理前放大系数（1–3），提高原图手部采样分辨率。
+SAM3D_UPSCALE = 1.0
+# 深度尺度拟合：off / moge / torso / limb（AFTER=True 时强制 torso）。
+SAM3D_SCALE_FIT = "limb"
+# 逐骨 k 离散度上限（仅 limb 档使用），超限跳过肢体修正。
+SAM3D_LIMB_K_SPREAD = 0.12
+LIMB_K_CLAMP = (0.75, 1.35)
+
+# MHR-70 → COCO-17 索引（与 ground_retarget.MHR70_COCO17 逐项一致）。
+MHR70_TO_COCO17 = (0, 1, 2, 3, 4, 5, 6, 7, 8, 62, 41, 9, 10, 11, 12, 13, 14)
+# COCO-17 四肢线段（肩肘腕、髋膝踝），躯干锚用它把四肢像素排除在统计之外。
+COCO17_LIMBS = ((5, 7), (7, 9), (6, 8), (8, 10), (11, 13), (13, 15), (12, 14), (14, 16))
+# 逐肢体骨表（名称, 起点 COCO-17, 终点 COCO-17），limb 档按骨求深度缩比。
+COCO17_LIMB_BONES = (
+    ("l_upper_arm", 5, 7),
+    ("l_forearm", 7, 9),
+    ("r_upper_arm", 6, 8),
+    ("r_forearm", 8, 10),
+    ("l_thigh", 11, 13),
+    ("l_shank", 13, 15),
+    ("r_thigh", 12, 14),
+    ("r_shank", 14, 16),
+)
 
 
 def _pose_overlay_data_uri(rgb: np.ndarray, keypoints: np.ndarray) -> str:
@@ -33,8 +61,7 @@ def _pose_overlay_data_uri(rgb: np.ndarray, keypoints: np.ndarray) -> str:
     height, width = rgb.shape[:2]
     line_width = max(6, min(12, round(min(width, height) / 85)))
     joint_radius = max(7, min(13, round(min(width, height) / 75)))
-    mhr70_to_coco17 = (0, 1, 2, 3, 4, 5, 6, 7, 8, 62, 41, 9, 10, 11, 12, 13, 14)
-    points = np.asarray(keypoints, dtype=np.float32)[list(mhr70_to_coco17)]
+    points = np.asarray(keypoints, dtype=np.float32)[list(MHR70_TO_COCO17)]
     visible = np.isfinite(points).all(axis=1)
     visible &= (points[:, 0] >= 0) & (points[:, 0] < width)
     visible &= (points[:, 1] >= 0) & (points[:, 1] < height)
@@ -122,27 +149,46 @@ def _pose_mesh_data_uri(vertices: np.ndarray, faces: np.ndarray) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-# SAM3D 推理类型（与环境变量语义保持一致，见 ai_vitpose/core/sam3d_adapter.py）：
-#   full（默认）= 身体解码 + 左右手解码，finger 关节不再是 T-pose，重定向手指链才有数据；
-#   body        = 仅身体解码（旧行为），手指停在 T-pose。
-SAM3D_INFERENCE_ENV = "POSEEXTRACTOR_SAM3D_INFERENCE"
-
-
 def sam3d_inference_type() -> str:
-    value = os.environ.get(SAM3D_INFERENCE_ENV, "").strip().lower()
+    value = str(SAM3D_INFERENCE_TYPE).strip().lower()
     return "body" if value == "body" else "full"
-
-
-# 推理前放大系数（1–3）。手部 crop 固定 512×512，放大原图可让手部从更多原始像素采样。
-SAM3D_UPSCALE_ENV = "POSEEXTRACTOR_SAM3D_UPSCALE"
 
 
 def sam3d_upscale() -> float:
     try:
-        value = float(os.environ.get(SAM3D_UPSCALE_ENV, "1") or 1.0)
-    except ValueError:
+        value = float(SAM3D_UPSCALE)
+    except (TypeError, ValueError):
         value = 1.0
     return min(max(value, 1.0), 3.0)
+
+
+def sam3d_scale_fit_mode() -> str:
+    value = str(SAM3D_SCALE_FIT).strip().lower()
+    if value in ("limb", "per_limb", "limbs", "local"):
+        return "limb"
+    if value in ("torso", "body", "center"):
+        return "torso"
+    if value in ("moge", "depth", "on", "1", "true"):
+        return "moge"
+    return "off"
+
+
+def limb_k_spread_limit() -> float:
+    # 门控用「逐骨 k 离散度 max-min」而非 2D 轮廓覆盖率：
+    # 覆盖率随衣物宽松度剧烈变化（w6d1j 宽松外套 sil/mask=0.47 → 0.518；90dc 四肢裸露 → 0.805），
+    # 且对沿相机射线的深度误差完全不可见（qco6j 覆盖率 0.699、未覆盖像素 p90=1px 却会把点云改差）。
+    # 7 张实测离散度：qco6j 0.226 / 006dpl 0.113 / 5306 0.092 / trvxj 0.084 / w6d1j 0.080 /
+    # z459j 0.075 / 90dc 0.056，取 0.12 只挡 qco6j（其逐骨 k 0.776~1.002、位移 55cm，
+    # 修正后 nn 3.20→4.02cm、3cm 内表面 45.6%→39.5%）。
+    try:
+        value = float(SAM3D_LIMB_K_SPREAD)
+    except (TypeError, ValueError):
+        value = 0.12
+    return max(value, 0.0)
+
+
+def sam3d_output_after() -> bool:
+    return SAM3D_OUTPUT_AFTER
 
 
 RAW_POSE_FIELDS = (
@@ -169,6 +215,10 @@ def _to_jsonable(value: Any) -> Any:
         value = value.detach().cpu().numpy()
     if isinstance(value, np.ndarray):
         return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: _to_jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_to_jsonable(item) for item in value]
     return value
@@ -192,6 +242,387 @@ def mask_to_bbox(person_mask: np.ndarray) -> np.ndarray:
         min(float(width - 1), x2 + pad_x),
         min(float(height - 1), y2 + pad_y),
     ]], dtype=np.float32)
+
+
+# 参与等比缩放的 3D 量：都乘同一系数，保证 2D 投影 f·x/z 不变。
+SCALE_KEYS = ("pred_vertices", "pred_keypoints_3d", "pred_joint_coords", "mhr_joint_coords")
+
+
+def torso_region_mask(person_mask, keypoints_2d, shape) -> dict | None:
+    """人物掩码内的躯干像素（去掉四肢带与轮廓边缘）。
+
+    四肢是 SAM-3D 网格与 MoGe-2 深度最容易分歧的部位，轮廓边缘又常混入背景深度；
+    把两者剔掉后剩下的身体中心像素更适合充当尺度锚点。
+    """
+    mask = np.asarray(person_mask)
+    if mask.ndim != 2 or mask.shape != tuple(shape):
+        return None
+    keypoints = np.asarray(keypoints_2d, dtype=np.float64)
+    if keypoints.ndim != 2 or keypoints.shape[0] <= max(max(p) for p in COCO17_LIMBS):
+        return None
+    coco = keypoints[list(MHR70_TO_COCO17), :2]
+    if not np.isfinite(coco[[5, 6, 9, 10, 11, 12, 13, 14, 15, 16]]).all():
+        return None
+    import cv2
+
+    mask = mask.astype(bool)
+    edge = max(3, int(round(0.008 * min(shape))))
+    inner = cv2.erode(
+        mask.astype(np.uint8), np.ones((2 * edge + 1, 2 * edge + 1), np.uint8),
+        borderType=cv2.BORDER_CONSTANT, borderValue=0,
+    ).astype(bool)
+    limb = np.zeros(mask.shape, np.uint8)
+    pts = np.rint(coco).astype(np.int32)
+    for a, b in COCO17_LIMBS:
+        half = max(0.20 * float(np.hypot(*(coco[b] - coco[a]))), 8.0)
+        cv2.line(limb, tuple(pts[a]), tuple(pts[b]), 1, int(round(2.0 * half)))
+    return {"torso": inner & (limb == 0), "limb": inner & (limb > 0)}
+
+
+def fit_scale_to_depth(
+    vertices,
+    cam_t,
+    depth,
+    cam_int,
+    person_mask=None,
+    *,
+    keypoints_2d=None,
+    min_samples: int = 200,
+    mode: str | None = None,
+) -> dict[str, Any] | None:
+    """用深度后端的实测深度把网格整体尺度拟合到场景。
+
+    网格顶点投到像素后建最小 z 缓冲（只保留可见前表面），与实测深度逐像素求比值，
+    取中位数作为沿相机射线的等比系数。单目只约束 f/z，等比缩放不改变 2D 投影。
+    mode=torso 时只用躯干区的中位数（四肢与轮廓边缘不参与）。
+    """
+    verts = np.asarray(vertices, dtype=np.float64).reshape(-1, 3) + np.asarray(
+        cam_t, dtype=np.float64
+    ).reshape(1, 3)
+    depth = np.asarray(depth, dtype=np.float64)
+    if depth.ndim != 2:
+        return None
+    z = verts[:, 2]
+    valid = np.isfinite(z) & (z > 1e-3)
+    if not np.any(valid):
+        return None
+    height, width = depth.shape
+    fx, fy = float(cam_int[0, 0]), float(cam_int[1, 1])
+    cx, cy = float(cam_int[0, 2]), float(cam_int[1, 2])
+    zsafe = np.where(valid, z, 1.0)
+    u = np.rint(fx * verts[:, 0] / zsafe + cx).astype(np.int64)
+    v = np.rint(fy * verts[:, 1] / zsafe + cy).astype(np.int64)
+    valid &= (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    if person_mask is not None and np.asarray(person_mask).shape == depth.shape:
+        valid &= np.asarray(person_mask, dtype=bool)[v.clip(0, height - 1), u.clip(0, width - 1)]
+    if np.count_nonzero(valid) < min_samples:
+        return None
+    u, v, z = u[valid], v[valid], z[valid]
+    zbuf = np.full(depth.shape, np.inf)  # 只保留可见表面，避免背面顶点把比值拉偏
+    np.minimum.at(zbuf, (v, u), z)
+    ok = np.isfinite(zbuf) & np.isfinite(depth) & (depth > 0)
+    if np.count_nonzero(ok) < min_samples:
+        return None
+    pv, pu = np.nonzero(ok)
+    ratio = depth[pv, pu] / zbuf[pv, pu]
+    keep = np.isfinite(ratio) & (ratio > 0)
+    pv, pu, ratio = pv[keep], pu[keep], ratio[keep]
+    if ratio.size < min_samples:
+        return None
+
+    mode = sam3d_scale_fit_mode() if mode is None else mode
+    detail: dict[str, Any] = {}
+    select = np.ones(ratio.size, dtype=bool)
+    regions = None
+    if mode in ("torso", "limb") and person_mask is not None:
+        regions = torso_region_mask(person_mask, keypoints_2d, depth.shape)
+    if regions is None and mode in ("torso", "limb"):
+        # 关键点/掩码不可用时不静默降级，直接记录并退回全图统计
+        detail["torso_fallback"] = "keypoints_or_mask_unavailable"
+    if regions is not None:
+        detail["ratio_full"] = float(np.median(ratio))
+        detail["samples_full"] = int(ratio.size)
+        torso_sel = regions["torso"][pv, pu]
+        limb_sel = regions["limb"][pv, pu]
+        if np.count_nonzero(torso_sel) >= min_samples:
+            select = torso_sel
+        else:
+            detail["torso_fallback"] = "too_few_torso_samples"
+        for name, sel in (("torso", torso_sel), ("limb", limb_sel)):
+            if np.count_nonzero(sel) >= min_samples:
+                detail[f"ratio_{name}"] = float(np.median(ratio[sel]))
+                detail[f"samples_{name}"] = int(np.count_nonzero(sel))
+    picked = ratio[select]
+    median = float(np.median(picked))
+    return {
+        "method": "moge_depth_surface_ratio",
+        "mode": mode,
+        "factor": float(min(max(median, 0.6), 1.6)),
+        "ratio_median": median,
+        "ratio_p25": float(np.percentile(picked, 25)),
+        "ratio_p75": float(np.percentile(picked, 75)),
+        "samples": int(picked.size),
+        **detail,
+    }
+
+
+def apply_uniform_scale(person: dict, factor: float) -> dict:
+    """沿相机射线等比缩放（3D 点与 cam_t 同乘 k），2D 投影 f·x/z 保持不变。"""
+    person = dict(person)
+    for key in SCALE_KEYS:
+        if person.get(key) is not None:
+            person[key] = np.asarray(person[key], dtype=np.float32) * factor
+    if person.get("pred_cam_t") is not None:
+        person["pred_cam_t"] = np.asarray(person["pred_cam_t"], dtype=np.float32) * factor
+    return person
+
+
+def _segment_distance(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """点到线段 a-b 的距离（points 支持 2D/3D，按末轴维度广播）。"""
+    ab = np.asarray(b, dtype=np.float64) - np.asarray(a, dtype=np.float64)
+    denom = float(np.dot(ab, ab))
+    if denom < 1e-12:
+        return np.linalg.norm(points - a, axis=-1)
+    t = np.clip(((points - a) @ ab) / denom, 0.0, 1.0)
+    proj = np.asarray(a, dtype=np.float64) + t[..., None] * ab
+    return np.linalg.norm(points - proj, axis=-1)
+
+
+def limb_scale_adjust(
+    vertices,
+    cam_t,
+    keypoints_3d,
+    keypoints_2d,
+    depth,
+    cam_int,
+    person_mask=None,
+    *,
+    faces=None,
+    min_samples: int = 120,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """按可见点云逐肢体骨修正顶点深度（沿各自相机射线缩放，2D 投影不变）。
+
+    SAM-3D 不暴露蒙皮权重，因此这里自己建立顶点→骨骼归属：
+    先用 2D 最近骨把「人物掩码内的四肢像素」分配给 8 根骨，得到逐骨深度比中位数 k_b；
+    再用「顶点到骨的 3D 距离高斯权重」把 k_b 融合成逐顶点系数 k(v)=1+Σw(k_b-1)/Σw；
+    最后 v'=(v+cam_t)·k(v)-cam_t。cam_t 与 joints/keypoints 均不动，只改网格。
+    逐骨 k 的离散度（max-min）超过阈值时判定该图深度不自洽，整段跳过。
+    """
+    cam_t = np.asarray(cam_t, dtype=np.float64).reshape(3)
+    verts = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+    kp3 = None if keypoints_3d is None else np.asarray(keypoints_3d, dtype=np.float64)
+    kp2 = None if keypoints_2d is None else np.asarray(keypoints_2d, dtype=np.float64)
+    depth = np.asarray(depth, dtype=np.float64)
+    need_row = max(max(pair[1], pair[2]) for pair in COCO17_LIMB_BONES)
+    detail: dict[str, Any] = {"enabled": True}
+    if (
+        depth.ndim != 2 or person_mask is None or cam_int is None
+        or kp3 is None or kp2 is None
+        or kp3.ndim != 2 or kp3.shape[0] <= need_row or kp3.shape[-1] != 3
+        or kp2.ndim != 2 or kp2.shape[0] != kp3.shape[0] or kp2.shape[-1] < 2
+    ):
+        return None, {**detail, "gate": "skipped", "reason": "bad_inputs"}
+
+    height, width = depth.shape
+    fx, fy = float(cam_int[0][0]), float(cam_int[1][1])
+    cx, cy = float(cam_int[0][2]), float(cam_int[1][2])
+    vcam = verts + cam_t.reshape(1, 3)
+    z = vcam[:, 2]
+    front = np.isfinite(z) & (z > 1e-3)
+    valid = front.copy()
+    if np.count_nonzero(valid) < min_samples:
+        return None, {**detail, "gate": "skipped", "reason": "too_few_vertices"}
+    zsafe = np.where(valid, z, 1.0)
+    u = np.rint(fx * vcam[:, 0] / zsafe + cx).astype(np.int64)
+    v = np.rint(fy * vcam[:, 1] / zsafe + cy).astype(np.int64)
+    valid &= (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    mask = np.asarray(person_mask, dtype=bool)
+    if mask.shape == depth.shape:
+        valid &= mask[v.clip(0, height - 1), u.clip(0, width - 1)]
+    if np.count_nonzero(valid) < min_samples:
+        return None, {**detail, "gate": "skipped", "reason": "too_few_projected"}
+
+    # 网格前表面 z 缓冲 → 图像平面上的四肢带覆盖度（即 x-z 前视轮廓吻合程度的代理）
+    zbuf = np.full(depth.shape, np.inf)
+    np.minimum.at(zbuf, (v[valid], u[valid]), z[valid])
+    regions = torso_region_mask(mask, kp2, depth.shape)
+    if regions is None:
+        return None, {**detail, "gate": "skipped", "reason": "regions_unavailable"}
+    band = regions["limb"]
+    band_px = int(np.count_nonzero(band))
+    if band_px < min_samples:
+        return None, {**detail, "gate": "skipped", "reason": "limb_band_too_small"}
+    # 轮廓：优先按三角面填充（与渲染一致），无面表时退回顶点足迹膨胀
+    import cv2
+
+    if faces is not None:
+        face_arr = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+        keep_face = front[face_arr].all(axis=1)
+        triangles = np.stack([u[face_arr], v[face_arr]], axis=-1).astype(np.int32)
+        silhouette = np.zeros(depth.shape, np.uint8)
+        cv2.fillPoly(silhouette, list(triangles[keep_face]), 1)
+    else:
+        footprint = np.zeros(depth.shape, np.uint8)
+        footprint[v[valid], u[valid]] = 1
+        silhouette = cv2.dilate(footprint, np.ones((5, 5), np.uint8))
+    coverage = float(np.count_nonzero(silhouette.astype(bool) & band) / band_px)
+
+    ok = np.isfinite(zbuf) & np.isfinite(depth) & (depth > 0)
+    pv, pu = np.nonzero(ok)
+    ratio = depth[pv, pu] / zbuf[pv, pu]
+    keep = np.isfinite(ratio) & (ratio > 0)
+    pv, pu, ratio = pv[keep], pu[keep], ratio[keep]
+
+    coco2 = kp2[list(MHR70_TO_COCO17), :2]
+    coco3 = kp3[list(MHR70_TO_COCO17), :3] + cam_t.reshape(1, 3)
+    if not np.isfinite(coco2).all() or not np.isfinite(coco3).all():
+        return None, {**detail, "gate": "skipped", "gate_iou": coverage,
+                      "reason": "keypoints_not_finite"}
+
+    # 1) 像素 → 最近骨（2D，仅取骨带内的像素）
+    pixels = np.stack([pu, pv], axis=1).astype(np.float64)
+    bone_ids = np.full(pixels.shape[0], -1, dtype=np.int64)
+    bone_dist = np.full(pixels.shape[0], np.inf)
+    for index, (_name, a, b) in enumerate(COCO17_LIMB_BONES):
+        dist = _segment_distance(pixels, coco2[a], coco2[b])
+        half = max(0.20 * float(np.hypot(*(coco2[b] - coco2[a]))), 8.0)
+        take = (dist <= half) & (dist < bone_dist)
+        bone_ids[take] = index
+        bone_dist[take] = dist[take]
+
+    # 2) 逐骨取深度比中位数
+    bones: list[dict[str, Any]] = []
+    kb = np.ones(len(COCO17_LIMB_BONES))
+    valid_bone = np.zeros(len(COCO17_LIMB_BONES), dtype=bool)
+    for index, (name, _a, _b) in enumerate(COCO17_LIMB_BONES):
+        sel = bone_ids == index
+        n = int(np.count_nonzero(sel))
+        if n < min_samples:
+            bones.append({"name": name, "k": 1.0, "n": n, "valid": False})
+            continue
+        value = float(np.median(ratio[sel]))
+        kb[index] = min(max(value, LIMB_K_CLAMP[0]), LIMB_K_CLAMP[1])
+        valid_bone[index] = True
+        bones.append({"name": name, "k": float(kb[index]), "n": n, "valid": True})
+    detail["bones"] = bones
+    detail["gate_iou"] = coverage  # 仅记录 2D 轮廓覆盖率，不参与判定
+    valid_ks = [float(b["k"]) for b in bones if b["valid"]]
+    spread = (max(valid_ks) - min(valid_ks)) if len(valid_ks) >= 2 else float("inf")
+    detail["k_spread"] = spread if np.isfinite(spread) else None
+    detail["k_spread_limit"] = limb_k_spread_limit()
+    detail["gate"] = "ok" if np.isfinite(spread) and spread <= detail["k_spread_limit"] else "skipped"
+    if not valid_bone.any():
+        detail["reason"] = "no_bone_samples"
+        return None, detail
+    if detail["gate"] != "ok":
+        detail["reason"] = "limb_k_inconsistent"
+        return None, detail
+
+    # 3) 顶点 → 骨（3D 高斯权重）→ 逐顶点系数 → 沿相机射线缩放
+    weight = np.zeros((verts.shape[0], len(COCO17_LIMB_BONES)))
+    for index, (_name, a, b) in enumerate(COCO17_LIMB_BONES):
+        if not valid_bone[index]:
+            continue
+        start, end = coco3[a], coco3[b]
+        sigma = max(0.30 * float(np.linalg.norm(end - start)), 0.045)
+        weight[:, index] = np.exp(-0.5 * (_segment_distance(vcam, start, end) / sigma) ** 2)
+    total = weight.sum(axis=1)
+    k = np.ones(verts.shape[0])
+    touched = total > 1e-6
+    k[touched] = 1.0 + (weight[touched] @ (kb - 1.0)) / total[touched]
+    new_verts = (vcam * k[:, None] - cam_t.reshape(1, 3)).astype(np.float32)
+    detail["k_min"] = float(k.min())
+    detail["k_max"] = float(k.max())
+    detail["weighted_vertices"] = int(np.count_nonzero(touched))
+    detail["max_shift_m"] = float(np.max(np.linalg.norm(new_verts - verts, axis=1)))
+    return new_verts, detail
+
+
+def apply_after_pose(person, faces, depth, person_mask, cam_int, image_hw, ground_rotation=None):
+    """Apply the shared visualization AFTER before generic-pose/retarget assembly."""
+    from .bone_depth_snap import apply_pose_bone_snap, _rotation_from_to
+    from .ground_retarget import FIGURE_P
+    from .mhr_mesh_fbx import get_rig, _topo_order
+
+    report = {"enabled": True, "applied": False, "source": "legacy_bone_snap_after"}
+    if person.get("rotation_fit") is not None:
+        return person, {**report, "reason": "rotation_fit_takes_priority"}
+    if depth is None or person_mask is None or cam_int is None:
+        return person, {**report, "reason": "missing_depth_mask_or_intrinsics"}
+    height, width = image_hw
+    dh, dw = np.asarray(depth).shape
+    k = np.asarray(cam_int, dtype=np.float64).copy()
+    k[0] *= dw / width
+    k[1] *= dh / height
+    # The legacy rasterizer uses a centered, square-pixel pinhole camera.
+    if not np.allclose([k[0, 0], k[0, 2], k[1, 2]], [k[1, 1], dw / 2, dh / 2], atol=1.0):
+        return person, {**report, "reason": "unsupported_legacy_intrinsics"}
+    cam_t = np.asarray(person["pred_cam_t"], dtype=np.float64).reshape(3)
+    verts = np.asarray(person["pred_vertices"], dtype=np.float64) + cam_t
+    kp = np.asarray(person["pred_keypoints_3d"], dtype=np.float64) + cam_t
+    joints = np.asarray(person["pred_joint_coords"], dtype=np.float64) + cam_t
+    coco = kp[list(MHR70_TO_COCO17)]
+    baseline = {"camera_space": {"vertices": verts.tolist(), "faces": np.asarray(faces).tolist(),
+                                "keypoints_3d_coco17": coco.tolist()},
+                "generic_pose": {"pred_joint_coords": ((joints - cam_t) @ FIGURE_P.T).tolist(),
+                                 "pred_keypoints_3d": ((kp - cam_t) @ FIGURE_P.T).tolist(),
+                                 "pred_cam_t": cam_t.tolist()}}
+    if ground_rotation is not None:
+        rot = np.asarray(ground_rotation, dtype=np.float64).reshape(3, 3)
+        baseline["world"] = {"status": "ok", "rotation": rot.tolist(), "translation": [0, 0, 0],
+                             "mesh": {"vertices": (verts @ rot.T).tolist()},
+                             "keypoints_3d_coco17": (coco @ rot.T).tolist(),
+                             "generic_pose": {"pred_joint_coords": (joints @ rot.T).tolist()}}
+    adjusted, _, detail = apply_pose_bone_snap(
+        baseline, baseline, depth, person_mask, float(k[0, 0]))
+    report.update(detail)
+    if not report.get("applied"):
+        return person, report
+    block = adjusted["camera_space"]
+    after_joints = np.asarray(block["keypoints_3d_fine"], dtype=np.float64)
+    if after_joints.shape != joints.shape:
+        return person, {**report, "applied": False, "reason": "missing_after_mhr_joints"}
+    after_kp = np.asarray(block["keypoints_3d_coco17"], dtype=np.float64)
+    from .bone_depth_snap import deform_points
+
+    kp_new = deform_points(kp, coco, after_kp)
+    kp_new[list(MHR70_TO_COCO17)] = after_kp
+    rig = get_rig()
+    index, parents = rig["index"], rig["parents"]
+    old_rots = np.asarray(person["pred_global_rots"], dtype=np.float64)
+    new_rots = old_rots.copy()
+    children = {name: [] for name in rig["bone_order"]}
+    for name, parent in parents.items():
+        if parent is not None:
+            children[parent].append(name)
+    sign = np.diag([1.0, -1.0, -1.0])
+    for name in _topo_order(rig):
+        i = index[name]
+        candidates = [c for c in children[name] if "twist" not in c and "_null" not in c]
+        if candidates:
+            child = max(candidates, key=lambda c: np.linalg.norm(joints[index[c]] - joints[i]))
+            a = joints[index[child]] - joints[i]
+            b = after_joints[index[child]] - after_joints[i]
+            if min(np.linalg.norm(a), np.linalg.norm(b)) > 1e-8:
+                delta = _rotation_from_to(a / np.linalg.norm(a), b / np.linalg.norm(b))
+                new_rots[i] = sign @ delta @ sign @ old_rots[i]
+        elif parents[name] is not None:
+            parent = index[parents[name]]
+            new_rots[i] = new_rots[parent] @ old_rots[parent].T @ old_rots[i]
+    result = dict(person)
+    result["pred_vertices"] = (np.asarray(block["vertices"]) - cam_t).astype(np.float32)
+    result["pred_keypoints_3d"] = (kp_new - cam_t).astype(np.float32)
+    result["pred_joint_coords"] = (after_joints - cam_t).astype(np.float32)
+    result["pred_global_rots"] = new_rots.astype(np.float32)
+    for alias, source in (("mhr_joint_coords", "pred_joint_coords"),
+                          ("mhr_joint_global_rots", "pred_global_rots")):
+        if alias in person:
+            result[alias] = result[source]
+    projected = float(np.asarray(person["focal_length"]).reshape(-1)[0]) * kp_new[:, :2] / kp_new[:, 2:3]
+    result["pred_keypoints_2d"] = (projected + [width / 2, height / 2]).astype(np.float32)
+    report["rotation_source"] = "after_joint_swing_preserving_input_twist"
+    report["native_parameters_match_output"] = False
+    return result, report
 
 
 class GroundPoseEstimator:
@@ -240,6 +671,8 @@ class GroundPoseEstimator:
         cam_int: np.ndarray | None = None,
         include_raw: bool = False,
         bbox: np.ndarray | None = None,
+        depth: np.ndarray | None = None,
+        ground_rotation: np.ndarray | None = None,
     ) -> dict[str, Any]:
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError("Expected an RGB HxWx3 image")
@@ -297,6 +730,57 @@ class GroundPoseEstimator:
             for key in ("lhand_bbox", "rhand_bbox"):
                 if person.get(key) is not None:
                     person[key] = np.asarray(person[key], dtype=np.float32) / scale
+        from .mhr_rotation_fit import (fit_native_rotations, rotation_fit_enabled,
+                                       synchronize_native_person)
+
+        rotation_enabled = rotation_fit_enabled()
+        # Replay both baseline and fitted final hand/body state without changing vendor code.
+        with self._lock, torch.inference_mode():
+            model = self.estimator.model
+            inner = getattr(model, "inner", model)
+            head = inner.head_pose
+            original_device = head.scale_mean.device
+            try:
+                head.to(self.estimator.device)
+                person = synchronize_native_person(person, head)
+                if rotation_enabled:
+                    person = fit_native_rotations(
+                        person, head, depth, person_mask, cam_int, (height, width)
+                    )
+            finally:
+                head.to(original_device)
+                if original_device.type == "cpu":
+                    torch.cuda.empty_cache()
+        # 旋转模式冻结尺度及相机参数，禁止再进入等比缩放或逐顶点 limb 修正。
+        scale_fit: dict[str, Any] | None = None
+        output_after = sam3d_output_after()
+        fit_mode = "torso" if output_after and not rotation_enabled else sam3d_scale_fit_mode()
+        if not rotation_enabled and fit_mode != "off" and depth is not None and cam_int is not None:
+            scale_fit = fit_scale_to_depth(
+                person["pred_vertices"], person["pred_cam_t"], depth, cam_int, person_mask,
+                keypoints_2d=person.get("pred_keypoints_2d"), mode=fit_mode,
+            )
+            if scale_fit is not None:
+                person = apply_uniform_scale(person, scale_fit["factor"])
+        # 可选：在躯干锚之上再按可见点云逐肢体骨修顶点深度（只改网格，不动骨骼/关键点）。
+        if fit_mode == "limb" and scale_fit is not None:
+            new_verts, limb_detail = limb_scale_adjust(
+                person["pred_vertices"], person["pred_cam_t"],
+                person.get("pred_keypoints_3d"), person.get("pred_keypoints_2d"),
+                depth, cam_int, person_mask, faces=self.estimator.faces,
+            )
+            scale_fit["limb"] = limb_detail
+            if new_verts is not None:
+                person = dict(person)
+                person["pred_vertices"] = new_verts
+        after_report = {"enabled": False, "applied": False, "reason": "disabled"}
+        if output_after:
+            person, after_report = apply_after_pose(
+                person, self.estimator.faces, depth, person_mask, cam_int,
+                (height, width), ground_rotation,
+            )
+            if scale_fit is not None:
+                scale_fit["bonesnap"] = after_report
         from ai_vitpose.core.normalize import camera_points_to_figure_frame, skeleton24
 
         joints = camera_points_to_figure_frame(skeleton24(person["pred_joint_coords"]))
@@ -307,7 +791,10 @@ class GroundPoseEstimator:
             "translation": np.asarray(person["pred_cam_t"]).reshape(-1).tolist(),
             "image_width": width,
             "image_height": height,
-            "calibration": "model_default_fov_not_measured",
+            "calibration": (
+                "measured_intrinsics" if cam_int is not None
+                else "model_default_fov_not_measured"
+            ),
         }
         if not np.isfinite(camera["focal_px"]) or not np.isfinite(camera["translation"]).all():
             raise ValueError("SAM3D returned invalid camera parameters")
@@ -323,10 +810,19 @@ class GroundPoseEstimator:
             "camera": camera,
             "sam3d_inference_type": mode,
             "sam3d_upscale": scale,
+            "pose_adjustment": after_report,
+            "output_pose_stage": "after" if after_report.get("applied") else "before",
+            "scale_fit": scale_fit if scale_fit is not None else {"mode": fit_mode, "factor": 1.0},
         }
+        if rotation_enabled:
+            result["rotation_fit"] = person["rotation_fit"]
+            result["scale_fit"] = {"mode": "off", "factor": 1.0,
+                                   "reason": "rotation_only_freezes_scale", "requested_mode": fit_mode}
         if include_raw:
+            from .mhr_rotation_fit import ROTATION_RAW_FIELDS
+
             raw: dict[str, Any] = {}
-            for key in RAW_POSE_FIELDS:
+            for key in RAW_POSE_FIELDS + ROTATION_RAW_FIELDS:
                 value = person.get(key)
                 if value is None:
                     continue
@@ -336,6 +832,7 @@ class GroundPoseEstimator:
                     raw[f"{key}_error"] = f"{type(exc).__name__}: {exc}"
             raw["sam3d_inference_type"] = mode
             raw["sam3d_upscale"] = scale
+            raw["pose_adjustment"] = after_report
             result["raw"] = raw
         if want_overlay:
             try:

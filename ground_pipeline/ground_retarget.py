@@ -1598,6 +1598,13 @@ class RetargetAdapter:
                 "lhand_bbox": raw.get("lhand_bbox"),
                 "rhand_bbox": raw.get("rhand_bbox"),
             }
+            from .mhr_rotation_fit import ROTATION_RAW_FIELDS
+
+            for key in ROTATION_RAW_FIELDS:
+                if key in raw:
+                    body["raw"][key] = raw[key]
+        if raw.get("rotation_fit") is not None:
+            body["rotation_fit"] = raw["rotation_fit"]
 
         bip22_joints = (
             np.asarray(cs_block["bip22_joints"], dtype=np.float32) if cs_block else None
