@@ -1,7 +1,7 @@
 """
 ground_pipeline 地面提取服务
 
-- 一次启动加载 LangSAM（GroundingDINO + SAM2）与 DepthPro 模型
+- 一次启动加载 LangSAM（GroundingDINO + SAM2）与深度模型（DepthPro / MoGe-2，可切换）
 - 接口输入图片（Base64 data URI / HTTP URL / 本地路径），输出地面平面参数与点云采样
 
 用法：
@@ -30,10 +30,10 @@ import torch
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, model_serializer
 
-import depth_pro
 from lang_sam import LangSAM
 
 from ground_pipeline import extract_ground
+from ground_pipeline.depth_backend import MOGE_MODEL_DEFAULT, build_depth_backend
 from ground_pipeline.pose_queue import (
     PRIORITY_GROUND,
     PRIORITY_INTERACTIVE,
@@ -112,6 +112,8 @@ class GroundResult(BaseModel):
     # 相机系 / 世界系分组输出（顶层旧字段保留，向后兼容）
     camera: Optional[Dict[str, Any]] = None
     world: Optional[Dict[str, Any]] = None
+    # 分段耗时（segment/depth/ground/pose/post）+ 显存峰值，仅用于 P0 性能测量
+    timings: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -144,6 +146,26 @@ def _to_data_uri(buf: io.BytesIO) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def _gpu_memory_mb() -> Tuple[Optional[float], Optional[float]]:
+    """(当前已分配, 进程峰值) 显存 MB；CUDA 不可用时返回 (None, None)。"""
+    if not torch.cuda.is_available():
+        return None, None
+    mib = 1024 ** 2
+    return (
+        round(torch.cuda.memory_allocated() / mib, 1),
+        round(torch.cuda.max_memory_allocated() / mib, 1),
+    )
+
+
+def _log_stage_timings(endpoint: str, timings: Dict[str, Any]) -> None:
+    """分段计时写日志（key=value，便于脚本解析）。"""
+    logger.info(
+        "stage_timing endpoint=%s %s",
+        endpoint,
+        " ".join(f"{key}={value}" for key, value in timings.items()),
+    )
+
+
 def _mask_png(mask: np.ndarray) -> str:
     """二值 mask -> 8-bit 灰度 PNG base64 data URI（0/255，可用 PIL/OpenCV 直接还原为布尔数组）。"""
     from PIL import Image
@@ -161,15 +183,16 @@ def _npy_b64(arr: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _pose_vitpose_bbox(rgb: np.ndarray) -> Optional[np.ndarray]:
-    """无地面时按参考实现用 ViTPose 关键点框；ViTPose 不可用则返回 None（回退人物 mask 框）。"""
-    try:
-        from ai_vitpose.core import vitpose_detector
+def _pose_vitpose_bbox(rgb: np.ndarray):
+    """一次 ViTPose 推理同时保留真实坐标/分数与紧框。"""
+    from ground_pipeline.joint_quality import detect_vitpose, vitpose_bbox
 
-        return vitpose_detector.vitpose_bbox(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    except Exception as exc:  # noqa: BLE001 - ViTPose 可选，缺失时不影响姿势推理
-        logger.warning("ViTPose bbox 不可用，SAM3D 使用人物 mask 框: %s", exc)
-        return None
+    try:
+        points, info = detect_vitpose(rgb)
+        return vitpose_bbox(points, rgb.shape[:2]), points, info
+    except Exception as exc:  # noqa: BLE001 - 可选模型缺失不阻断 SAM3D
+        logger.warning("ViTPose 不可用，SAM3D 使用人物 mask 框: %s", exc)
+        return None, None, {"status": "unavailable", "error": str(exc)}
 
 
 def _person_mask(segmenter, image_pil, person_prompt: str) -> Optional[np.ndarray]:
@@ -356,7 +379,7 @@ def _rigid_fit(src, dst, weights=None):
 
 
 def _keypoints_depth_camera(keypoints_2d, depth, intrinsics, person_mask):
-    """在关键点像素位置采样 DepthPro 深度，反投影为相机系点并给出置信度权重。"""
+    """在关键点像素位置采样深度模型输出，反投影为相机系点并给出置信度权重。"""
     height, width = depth.shape
     fx, fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
     cx, cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
@@ -667,7 +690,7 @@ def _align_pose_mesh_by_ground(
 ):
     """相机系地面锚定：只做刚体变换（不缩放），把 SAM3D 自带接触面转平并落位。
 
-    SAM3D 的原始输出在相机空间通常已经站在它自己感知到的地面上，与 DepthPro 检测到的
+    SAM3D 的原始输出在相机空间通常已经站在它自己感知到的地面上，与深度模型检测到的
     相机系地面之间只差「接触面倾角」和「几厘米的高度」。因此这里取网格最低分位顶点
     拟合接触面，把该面法向旋到地面法向（转角上限 max_tilt_deg），再沿地面法向平移
     使最低分位高度归零。尺度保持 1.0，姿势完全冻结。
@@ -797,6 +820,11 @@ def _align_pose_mesh_to_depth(
     keypoints_2d = pose.pop("align_keypoints_2d", None)
     keypoints_3d = pose.pop("align_keypoints_3d_cam", None)
     focal_px = pose.pop("mesh_focal_px", None)
+    from ground_pipeline.mhr_rotation_fit import rotation_fit_enabled
+
+    # 旋转模式（包括无改善回退）不再做相似变换、ICP、地面吸附或整体刚体精修。
+    if rotation_fit_enabled() or pose.get("rotation_fit") is not None:
+        return vertices, {"status": "skipped", "reason": "rotation_only_preserves_native_pose"}
     if keypoints_2d is None or keypoints_3d is None:
         return vertices, {"status": "skipped", "reason": "SAM3D 未返回 MHR-70 关键点"}
     keypoints_2d = np.asarray(keypoints_2d, dtype=float)
@@ -843,7 +871,7 @@ def _align_pose_mesh_to_depth(
             "mesh_low_plane_tilt_deg": round(tilt, 2),
         }
     # A. 首选：相机系地面锚定（刚体、不缩放）。SAM3D 在相机空间本就站在自己感知到的
-    #    地面上，与 DepthPro 地面的差异只有接触面倾角与几厘米高度；关键点相似变换的
+    #    地面上，与当前深度模型地面的差异只有接触面倾角与几厘米高度；关键点相似变换的
     #    0.79 尺度正是姿势走样的根因，因此锚定成功时完全跳过它。
     ground_anchor = {"status": "skipped", "reason": "未提供地面平面"}
     if plane_normal is not None:
@@ -1133,7 +1161,7 @@ def _pose_world_view_png(depth, intrinsics, plane_normal, plane_d, person_points
         ax.plot([lower[0], lower[0]], [upper[1], lower[1]], [0, 0], color="#ff453a", alpha=0.7, lw=1.2)
 
     handles = [
-        Line2D([0], [0], marker="o", color="none", markerfacecolor="#a7b0bb", markersize=5, label="DepthPro scene cloud"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#a7b0bb", markersize=5, label="Depth scene cloud"),
         Line2D([0], [0], marker="o", color="none", markerfacecolor="#ffbd3f", markersize=5, label="person cloud"),
         Line2D([0], [0], marker="o", color="none", markerfacecolor="#22d3ee", markersize=5, label="SAM3D Body mesh"),
         Line2D([0], [0], color="#ff453a", lw=1.5, label="ground plane (z=0)"),
@@ -1142,7 +1170,7 @@ def _pose_world_view_png(depth, intrinsics, plane_normal, plane_d, person_points
         handles = [handle for handle in handles if handle.get_label() != "person cloud"]
     fig.legend(handles=handles, loc="lower center", ncol=4, frameon=False, fontsize=9)
     fig.suptitle(
-        "World 3-view | SAM3D mesh + DepthPro point cloud\n"
+        "World 3-view | SAM3D mesh + depth point cloud\n"
         + (mesh_note or "(mesh placement is visual only; not metrically calibrated)"),
         fontsize=11,
     )
@@ -1589,11 +1617,21 @@ def _pose_load_image(data: Dict[str, Any], upload: Optional[bytes] = None) -> np
 
 
 def _pose_infer_ground_transform(
-    state: Dict[str, Any], rgb: np.ndarray, *, floor_prompt: str
+    state: Dict[str, Any],
+    rgb: np.ndarray,
+    *,
+    floor_prompt: str,
+    timings: Optional[Dict[str, Any]] = None,
+    intrinsics_sink: Optional[Dict[str, Any]] = None,
 ) -> Optional[GroundTransform]:
-    """LangSAM + DepthPro + extract_ground -> GroundTransform；模型未就绪返回 None。"""
-    if state.get("segmenter") is None or state.get("depth") is None:
+    """LangSAM + 深度后端 + extract_ground -> GroundTransform；模型未就绪返回 None。
+
+    ``intrinsics_sink`` 用于把深度后端（MoGe-2）实测内参回传给调用方，
+    供 SAM-3D 使用，避免其退回默认 FOV 先验。
+    """
+    if state.get("segmenter") is None or state.get("depth_backend") is None:
         return None
+    t_segment = time.perf_counter()
     image_pil = __import__("PIL").Image.fromarray(rgb)
     segmentation = state["segmenter"].predict([image_pil], [floor_prompt])[0]
     masks = np.asarray(segmentation["masks"], dtype=bool)
@@ -1603,18 +1641,25 @@ def _pose_infer_ground_transform(
         floor_mask = masks.any(axis=0)
     else:
         raise ValueError("未检出地面区域")
+    if timings is not None:
+        timings["segment_ms"] = round((time.perf_counter() - t_segment) * 1000.0, 1)
 
-    model, transform, device = state["depth"], state["transform"], state["device"]
-    tensor = transform(rgb).to(device)
-    with torch.inference_mode():
-        pred = model.infer(tensor)
-    depth = pred["depth"].squeeze().detach().cpu().numpy()
-    f_px = float(pred["focallength_px"].detach().cpu().item())
-    height, width = rgb.shape[:2]
-    intrinsics = np.array(
-        [[f_px, 0, width / 2], [0, f_px, height / 2], [0, 0, 1]], dtype=np.float32
-    )
+    backend = state["depth_backend"]
+    t_depth = time.perf_counter()
+    depth, intrinsics = backend.infer(rgb)
+    f_px = float(intrinsics[0, 0])
+    if intrinsics_sink is not None:
+        intrinsics_sink["cam_int"] = np.asarray(intrinsics, dtype=np.float64).reshape(3, 3)
+        intrinsics_sink["image_hw"] = [int(rgb.shape[0]), int(rgb.shape[1])]
+        # 供可选的 SAM-3D 尺度拟合使用（POSEEXTRACTOR_SAM3D_SCALE_FIT），零额外推理。
+        intrinsics_sink["depth_m"] = np.asarray(depth, dtype=np.float32)
+    if timings is not None:
+        timings["depth_ms"] = round((time.perf_counter() - t_depth) * 1000.0, 1)
+        timings["depth_focal_px"] = round(f_px, 2)
+    t_ground = time.perf_counter()
     result = extract_ground(rgb, depth, intrinsics, floor_mask)
+    if timings is not None:
+        timings["ground_ms"] = round((time.perf_counter() - t_ground) * 1000.0, 1)
     return GroundTransform.from_plane(
         result["plane_normal"],
         float(result["plane_d"]),
@@ -1749,7 +1794,7 @@ def _pose_health(state: Dict[str, Any]) -> Dict[str, Any]:
     queue = state.get("pose_queue")
     engine_ready = state.get("pose_estimator") is not None
     adapter_health = adapter.health() if adapter is not None else {"ready": False, "error": "适配层未加载"}
-    ground_ready = state.get("segmenter") is not None and state.get("depth") is not None
+    ground_ready = state.get("segmenter") is not None and state.get("depth_backend") is not None
     disabled_reason = ""
     if not engine_ready:
         disabled_reason = str(state.get("pose_error") or "SAM3D 未配置或加载失败")
@@ -1777,7 +1822,7 @@ def _pose_health(state: Dict[str, Any]) -> Dict[str, Any]:
         "world": {
             "ready": bool(ground_ready),
             "segmenter": state.get("segmenter") is not None,
-            "depth": state.get("depth") is not None,
+            "depth": state.get("depth_backend") is not None,
         },
         "retarget": adapter_health,
         "queue": queue.summary()
@@ -1919,6 +1964,24 @@ def _pose_overlay_b64(
     return module.draw_overlay_jpeg_b64(bgr, kp)
 
 
+POSE_GROUND_MAX_TILT_DEG = 30.0
+POSE_GROUND_HEIGHT_RANGE_M = (0.7, 1.9)
+
+
+def _pose_ground_reject_reason(transform: GroundTransform) -> Optional[str]:
+    """验收推断地面：旋转会原样施加给整个人，不可信平面必须拦下。"""
+    normal = np.asarray(transform.plane_normal_camera, dtype=np.float64)
+    # 法向朝地下，相机系 y 轴向下，故与 (0, 1, 0) 的夹角即平面相对相机的倾斜
+    tilt = float(np.degrees(np.arccos(np.clip(float(normal[1]), -1.0, 1.0))))
+    if tilt > POSE_GROUND_MAX_TILT_DEG:
+        return f"地面法向与相机竖直方向夹角 {tilt:.1f}° 超过 {POSE_GROUND_MAX_TILT_DEG:.0f}°"
+    height = float(transform.camera_height_m)
+    low, high = POSE_GROUND_HEIGHT_RANGE_M
+    if not low <= height <= high:
+        return f"估计相机离地高度 {height:.2f} m 不在 {low:.1f}-{high:.1f} m"
+    return None
+
+
 def _pose_resolve_ground(
     state: Dict[str, Any],
     *,
@@ -1926,6 +1989,8 @@ def _pose_resolve_ground(
     ground_mode: str,
     rgb: np.ndarray,
     default_floor_prompt: str,
+    timings: Optional[Dict[str, Any]] = None,
+    intrinsics_sink: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[GroundTransform], str, Optional[str]]:
     """按 ground_mode 解析地平面，返回 ``(transform, status, error)``。"""
     if ground_mode == "none":
@@ -1937,7 +2002,13 @@ def _pose_resolve_ground(
     prompts = prompts if isinstance(prompts, dict) else {}
     floor_prompt = str(prompts.get("floor_prompt") or default_floor_prompt)
     try:
-        transform = _pose_infer_ground_transform(state, rgb, floor_prompt=floor_prompt)
+        transform = _pose_infer_ground_transform(
+            state,
+            rgb,
+            floor_prompt=floor_prompt,
+            timings=timings,
+            intrinsics_sink=intrinsics_sink,
+        )
     except ValueError as exc:
         status = "error" if ground_mode == "infer" else "skipped"
         return None, status, str(exc)
@@ -1947,13 +2018,23 @@ def _pose_resolve_ground(
         return None, status, f"{type(exc).__name__}: {exc}"
     if transform is None:
         if ground_mode == "infer":
-            raise RetargetError("DepthPro/LangSAM 未就绪，无法推理地面", status_code=503, stage="world")
+            raise RetargetError("深度后端/LangSAM 未就绪，无法推理地面", status_code=503, stage="world")
         return None, "skipped", "地面推理未就绪"
+    reason = _pose_ground_reject_reason(transform)
+    if reason is not None:
+        message = f"推断地面不可信：{reason}"
+        if ground_mode == "infer":
+            raise RetargetError(message, status_code=503, stage="world")
+        return None, "rejected", message
     return transform, "ok", None
 
 
 def _pose_apply_landing(transform: GroundTransform, raw: Dict[str, Any]) -> Dict[str, Any]:
     """Return the legacy ground snap plus an isolated, landed raw pose for world diagnostics."""
+    # 旋转输出仅允许既有相机到世界坐标换算，不另加网格落地平移。
+    if raw.get("rotation_fit") is not None:
+        return {"report": {"status": "skipped", "reason": "rotation_only_preserves_native_pose",
+                           "offset_m": 0.0}, "raw": raw}
     snap = landing_shift(
         transform,
         mesh_vertices=raw.get("pred_vertices"),
@@ -2107,6 +2188,46 @@ async def _pose_read_request(request: Request, content_type: str) -> Tuple[Dict[
     return payload, None
 
 
+def _pose_parse_cam_int(
+    data: Dict[str, Any], height: int, width: int
+) -> Optional[np.ndarray]:
+    """请求里的相机内参：``cam_int``（3x3 / [fx,fy,cx,cy] / 字典）或 ``focal_px``。"""
+    raw = data.get("cam_int", data.get("intrinsics"))
+    if raw is None and data.get("focal_px") is not None:
+        raw = {"fx": data.get("focal_px"), "fy": data.get("focal_px")}
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"无法解析：{exc}") from exc
+    if isinstance(raw, dict):
+        try:
+            fx = float(raw["fx"])
+            fy = float(raw.get("fy", fx))
+            cx = float(raw.get("cx", width / 2.0))
+            cy = float(raw.get("cy", height / 2.0))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("字典需要 fx/fy（可选 cx/cy）") from exc
+        matrix = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    else:
+        try:
+            arr = np.asarray(raw, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("必须是 3x3 矩阵或 [fx,fy,cx,cy]") from exc
+        if arr.shape == (4,):
+            fx, fy, cx, cy = (float(v) for v in arr.reshape(-1))
+            matrix = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+        elif arr.size == 9:
+            matrix = arr.reshape(3, 3)
+        else:
+            raise ValueError("必须是 3x3 矩阵或 [fx,fy,cx,cy]")
+    if not np.isfinite(matrix).all() or matrix[0, 0] <= 0 or matrix[1, 1] <= 0:
+        raise ValueError("焦距必须为有限正数")
+    return matrix
+
+
 def _pose_prepare(
     state: Dict[str, Any],
     data: Dict[str, Any],
@@ -2197,6 +2318,11 @@ def _pose_prepare(
                 ),
             )
 
+    try:
+        cam_int = _pose_parse_cam_int(data, rgb.shape[0], rgb.shape[1])
+    except ValueError as exc:
+        return None, (400, _pose_error_body(f"cam_int: {exc}", request_id=request_id))
+
     rid = request_id or uuid.uuid4().hex
     return (
         {
@@ -2207,6 +2333,7 @@ def _pose_prepare(
             "target": target,
             "estimator": estimator,
             "adapter": adapter,
+            "cam_int": cam_int,
             "want_overlay": want_overlay,
             "want_raw": want_raw,
             "want_world": want_world,
@@ -2228,6 +2355,7 @@ def _pose_execute(
     """worker 线程内的 GPU 段：分割 -> 地面 -> SAM3D -> 落地/重定向 -> world/overlay。"""
     exec_started = time.perf_counter()
     rid: str = prepared["request_id"]
+    timings: Dict[str, Any] = {"request_id": rid}
     started: float = prepared["started"]
     rgb: np.ndarray = prepared["rgb"]
     data: Dict[str, Any] = prepared["data"]
@@ -2240,8 +2368,12 @@ def _pose_execute(
     want_mesh: bool = prepared["want_mesh"]
     align_gravity: bool = prepared["align_gravity"]
     ground_mode: str = prepared["ground_mode"]
+    # 请求显式给了内参就用请求的；否则复用地面推理时的深度后端内参。
+    cam_int = prepared.get("cam_int")
+    cam_int_source = "request" if cam_int is not None else "model_default_fov"
 
     image_pil = __import__("PIL").Image.fromarray(rgb)
+    t_person = time.perf_counter()
     person_mask = None
     try:
         person_mask = _person_mask(state["segmenter"], image_pil, state.get("person_prompt") or "")
@@ -2252,13 +2384,18 @@ def _pose_execute(
         bbox_source = "full_image"
     else:
         bbox_source = "mask"
+    timings["person_segment_ms"] = round((time.perf_counter() - t_person) * 1000.0, 1)
 
     ground_transform: Optional[GroundTransform] = None
     ground_status = "skipped"
     ground_error: Optional[str] = None
     landing: Optional[Dict[str, Any]] = None
     world_raw = None
+    from ground_pipeline.ground_pose import sam3d_output_after
+
+    output_after = sam3d_output_after()
     run_ground = want_world or align_gravity
+    measured_cam: Dict[str, Any] = {}
     if run_ground:
         try:
             ground_transform, ground_status, ground_error = _pose_resolve_ground(
@@ -2267,29 +2404,54 @@ def _pose_execute(
                 ground_mode=ground_mode,
                 rgb=rgb,
                 default_floor_prompt=state.get("floor_prompt") or DEFAULT_FLOOR_PROMPT,
+                timings=timings,
+                intrinsics_sink=measured_cam,
             )
         except RetargetError as exc:
             if want_world:
                 return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
             ground_status, ground_error = "error", str(exc)
+    if output_after and measured_cam.get("depth_m") is None:
+        backend = state.get("depth_backend")
+        if backend is None:
+            return 503, _pose_error_body("engine: AFTER 调整需要已加载的深度后端", request_id=rid, target=target)
+        try:
+            t_depth = time.perf_counter()
+            depth, intrinsics = backend.infer(rgb)
+            measured_cam["depth_m"] = np.asarray(depth, dtype=np.float32)
+            measured_cam["cam_int"] = np.asarray(intrinsics, dtype=np.float64).reshape(3, 3)
+            timings["depth_ms"] = round((time.perf_counter() - t_depth) * 1000.0, 1)
+        except Exception as exc:
+            return 500, _pose_error_body(f"engine: AFTER 深度推理失败: {exc}", request_id=rid, target=target)
+    if cam_int is None and measured_cam.get("cam_int") is not None:
+        cam_int = measured_cam["cam_int"]
+        cam_int_source = "measured_moge2"
 
-    # bbox 决策：地面可用 -> mask 框；地面不可用 -> ViTPose 框（不可用再回退 mask/整图）
-    pose_bbox = None
-    if ground_transform is None:
-        pose_bbox = _pose_vitpose_bbox(rgb)
-        if pose_bbox is not None:
+    # bbox 决策：统一用 ViTPose 关键点紧框（bbox 尺寸直接进 tz=2f/bs，mask 框会被白背景/道具污染）；
+    # ViTPose 不可用或关键点不足（退化成整图框）时，回退人物 mask 框。
+    pose_bbox, vitpose_points, vitpose_info = _pose_vitpose_bbox(rgb)
+    if pose_bbox is not None:
+        x1, y1, x2, y2 = np.asarray(pose_bbox[0], dtype=np.float64)
+        if x1 <= 1.0 and y1 <= 1.0 and x2 >= rgb.shape[1] - 2.0 and y2 >= rgb.shape[0] - 2.0:
+            pose_bbox = None
+        else:
             bbox_source = "vitpose"
 
     try:
+        t_pose = time.perf_counter()
         pose = estimator.infer(
             rgb,
             person_mask,
             want_overlay=False,
             want_mesh=False,
-            cam_int=None,
+            cam_int=cam_int,
             include_raw=True,
             bbox=pose_bbox[0] if pose_bbox is not None else None,
+            depth=measured_cam.get("depth_m"),
+            ground_rotation=ground_transform.rotation if ground_transform is not None else None,
         )
+        timings["pose_ms"] = round((time.perf_counter() - t_pose) * 1000.0, 1)
+        timings["cam_int_source"] = cam_int_source
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         return 503, _pose_error_body("engine: CUDA 显存不足，请稍后重试", request_id=rid, target=target)
@@ -2323,6 +2485,22 @@ def _pose_execute(
         )
     except RetargetError as exc:
         return exc.status_code, _pose_error_body(f"{exc.stage}: {exc}", request_id=rid, target=target)
+
+    from ground_pipeline.joint_quality import build_joint_annotations, estimate_visibility
+
+    quality_cam = _pose_camera_space_block(state, raw, internal.get("keypoints_3d_cam")) or {}
+    camera = pose.get("camera") or {}
+    focal_quality = float(camera.get("focal_px") or 0.0)
+    focal_quality *= rgb.shape[1] / float(camera.get("image_width") or rgb.shape[1])
+    visibility = estimate_visibility(
+        quality_cam.get("keypoints_3d_coco17", []), quality_cam.get("vertices", []),
+        quality_cam.get("faces", []), focal_quality, rgb.shape[:2],
+        depth=measured_cam.get("depth_m"), mask=person_mask,
+    )
+    body["keypoints_2d_vitpose_coco17"] = vitpose_points.tolist() if vitpose_points is not None else None
+    body["vitpose_info"] = vitpose_info
+    body["joint_annotations"] = build_joint_annotations(vitpose_points, vitpose_info, visibility)
+    body["keypoints_2d_coco17_source"] = "sam3d_projection_with_fixed_placeholder_score"
 
     # 目标骨架重定向（figure_v6 系）
     retarget_status = "skipped"
@@ -2381,20 +2559,28 @@ def _pose_execute(
             world = skipped_world(ground_status, ground_mode=ground_mode, error=ground_error)
         body["world"] = world
 
-    resolve_gravity_alignment(
+    # 旋转输出不绕骨盆另转整体姿势，也不重算落地；world 固定坐标转换照常保留。
+    rotation_only = raw.get("rotation_fit") is not None
+    gravity_report = resolve_gravity_alignment(
         body,
         ground_transform,
-        align=align_gravity,
+        align=align_gravity and not rotation_only,
         ground_status=ground_status,
         ground_error=ground_error,
         mesh_vertices=raw.get("pred_vertices"),
     )
+    if rotation_only:
+        gravity_report["reason"] = "rotation_only_preserves_native_pose"
     body["bbox_source"] = bbox_source
     body["sam3d_inference_type"] = pose.get("sam3d_inference_type")
     body["sam3d_upscale"] = pose.get("sam3d_upscale")
+    body["scale_fit"] = pose.get("scale_fit")
+    body["pose_adjustment"] = pose.get("pose_adjustment")
+    body["output_pose_stage"] = pose.get("output_pose_stage", "before")
 
-    # 无可靠世界系（want_world=false 或地面推理失败）时，额外给出相机锚定回退块
-    if want_mesh and (world is None or world.get("status") != "ok"):
+    # 相机锚定块始终输出（与地面是否可信无关）：世界系含落地/重力对齐平移，
+    # 只有未经地面变换的 camera_v1 几何才能与原图成像严格重合。
+    if want_mesh:
         cam_block = _pose_camera_space_block(state, raw, internal.get("keypoints_3d_cam"))
         if cam_block is not None:
             body["camera_space"] = cam_block
@@ -2414,6 +2600,17 @@ def _pose_execute(
 
     body["request_id"] = rid
     body["time_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    # 分段耗时（P0 性能测量；post_ms = 落地/对齐/重定向/world/overlay 编码）
+    post_total_ms = round((time.perf_counter() - exec_started) * 1000.0, 1)
+    measured_ms = sum(
+        float(timings.get(key) or 0.0)
+        for key in ("person_segment_ms", "segment_ms", "depth_ms", "ground_ms", "pose_ms")
+    )
+    timings["post_ms"] = round(max(0.0, post_total_ms - measured_ms), 1)
+    timings["exec_total_ms"] = post_total_ms
+    timings["gpu_alloc_mb"], timings["gpu_peak_mb"] = _gpu_memory_mb()
+    body["timings"] = timings
+    _log_stage_timings("pose_single", timings)
     body.update(_pose_target_fields(target))
 
     diagnostics = body.get("retarget_diagnostics") or {}
@@ -2642,6 +2839,10 @@ def create_ground_app(
     floor_prompt: str = DEFAULT_FLOOR_PROMPT,
     person_prompt: str = "person.",
     sam3d_resources: Optional[str | Path] = None,
+    depth_backend: str = "depthpro",
+    moge_model: str = MOGE_MODEL_DEFAULT,
+    moge_num_tokens: Optional[int] = None,
+    depth_fp16: bool = False,
     pose_queue_size: int = 16,
     pose_queue_timeout: float = 60.0,
     pose_queue_per_client: int = 4,
@@ -2658,8 +2859,9 @@ def create_ground_app(
     )
     state: Dict[str, Any] = {
         "segmenter": None,
-        "depth": None,
-        "transform": None,
+        "depth_backend": None,
+        "depth_backend_name": depth_backend,
+        "depth_model_name": moge_model if depth_backend == "moge2" else "depth-pro",
         "device": torch.device("cpu"),
         "pose_estimator": None,
         "pose_error": "",
@@ -2679,17 +2881,22 @@ def create_ground_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("启动地面提取服务，加载模型 (device=%s)...", state["device"])
-        # 注意加载顺序：必须先加载 DepthPro 初始化 CUDA 上下文，再加载 LangSAM。
+        # 注意加载顺序：必须先加载深度模型初始化 CUDA 上下文，再加载 LangSAM。
         # 若 SAM2 作为第一个 CUDA 模型加载，GroundingDINO 前向传播会导致 WSL VM 崩溃。
-        model, transform = depth_pro.create_model_and_transforms(device=state["device"])
-        model.eval()
-        state["depth"], state["transform"] = model, transform
-        logger.info("DepthPro 加载完成")
+        backend = build_depth_backend(
+            depth_backend,
+            device=str(state["device"]),
+            moge_model=moge_model,
+            moge_num_tokens=moge_num_tokens,
+            use_fp16=depth_fp16,
+        )
+        state["depth_backend"] = backend
+        logger.info("深度后端加载完成: %s (%s)", backend.name, backend.model_name)
         state["segmenter"] = LangSAM(sam_type=sam_type, ckpt_path=str(sam_ckpt))
         logger.info("LangSAM 加载完成")
         if state["sam3d_resources"]:
             try:
-                from ground_pose import GroundPoseEstimator
+                from ground_pipeline.ground_pose import GroundPoseEstimator
 
                 state["pose_estimator"] = GroundPoseEstimator(state["sam3d_resources"])
                 logger.info("SAM3D Body 姿势模块加载完成")
@@ -2723,7 +2930,7 @@ def create_ground_app(
 
     app = FastAPI(
         title="ground_pipeline Ground-plane API",
-        description="RGB -> LangSAM 地面分割 -> DepthPro 深度 -> 地面平面拟合",
+        description="RGB -> LangSAM 地面分割 -> 可切换深度模型 -> 地面平面拟合",
         version="0.1.0",
         lifespan=lifespan,
     )
@@ -2731,8 +2938,10 @@ def create_ground_app(
     @app.get("/health")
     async def health():
         return {
-            "ok": state["segmenter"] is not None and state["depth"] is not None,
+            "ok": state["segmenter"] is not None and state["depth_backend"] is not None,
             "device": str(state["device"]),
+            "depth_backend": state["depth_backend"].name if state["depth_backend"] else state["depth_backend_name"],
+            "depth_model": state["depth_backend"].model_name if state["depth_backend"] else state["depth_model_name"],
         }
 
     @app.get("/")
@@ -2762,9 +2971,11 @@ def create_ground_app(
 
     @app.post("/v1/ground", response_model=GroundResult)
     async def ground(request: GroundRequest, http: Request):
-        if state["segmenter"] is None or state["depth"] is None:
+        if state["segmenter"] is None or state["depth_backend"] is None:
             raise HTTPException(status_code=503, detail="模型未就绪（可能加载失败），请检查服务日志")
 
+        started = time.perf_counter()
+        alloc_before_mb, _ = _gpu_memory_mb()
         rgb = _load_image(request.image)
         image_pil = __import__("PIL").Image.fromarray(rgb)
         if request.floor_prompt is None:
@@ -2795,21 +3006,21 @@ def create_ground_app(
             except Exception as e:
                 logger.warning("人物分割失败，跳过接触区域检测: %s", e)
                 person_mask = None
+        segment_ms = round((time.perf_counter() - started) * 1000.0, 1)
 
         try:
-            model, transform, device = state["depth"], state["transform"], state["device"]
-            tensor = transform(rgb).to(device)
-            with torch.inference_mode():
-                pred = model.infer(tensor)
-            depth = pred["depth"].squeeze().detach().cpu().numpy()
-            f_px = float(pred["focallength_px"].detach().cpu().item())
+            t_depth = time.perf_counter()
+            depth, intrinsics = state["depth_backend"].infer(rgb)
+            f_px = float(intrinsics[0, 0])
+            depth_ms = round((time.perf_counter() - t_depth) * 1000.0, 1)
+            alloc_after_depth_mb, _ = _gpu_memory_mb()
         except Exception as e:
-            logger.exception("DepthPro 推理失败")
+            logger.exception("深度后端推理失败")
             raise HTTPException(status_code=500, detail=f"深度推理失败: {e}")
 
         height, width = rgb.shape[:2]
-        intrinsics = np.array([[f_px, 0, width / 2], [0, f_px, height / 2], [0, 0, 1]], dtype=np.float32)
         try:
+            t_ground = time.perf_counter()
             result = extract_ground(
                 rgb,
                 depth,
@@ -2819,10 +3030,12 @@ def create_ground_app(
                 iterations=request.iterations,
                 grid_steps=request.grid_steps,
             )
+            ground_ms = round((time.perf_counter() - t_ground) * 1000.0, 1)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
 
         pose = None
+        pose_wall_ms = None
         if request.pose_inference:
             if person_mask is None or not person_mask.any():
                 pose = {"status": "skipped", "engine": "sam3d_body_vith", "error": "人物 mask 不存在或为空"}
@@ -2832,6 +3045,7 @@ def create_ground_app(
                 from starlette.concurrency import run_in_threadpool
 
                 # 与 /v1|v2/pose/* 共用队列（内部低优先级 5）；拒绝/超时只降级 pose
+                t_pose = time.perf_counter()
                 pose = await run_in_threadpool(
                     _pose_ground_infer,
                     state,
@@ -2842,6 +3056,7 @@ def create_ground_app(
                     cam_int=intrinsics,
                     client_key=_pose_client_key({}, http),
                 )
+                pose_wall_ms = round((time.perf_counter() - t_pose) * 1000.0, 1)
 
         # 人物 3D 点云 bbox（相机坐标系轴对齐）：取人物 mask 中有效反投影点的 x/y/z min/max。
         person_bbox_3d_m = None
@@ -3039,7 +3254,7 @@ def create_ground_app(
                                     f" / rot {refine['delta_rot_deg']:.1f} deg"
                                     f" / contact {refine['contact_height_after_m'] * 100:.1f} cm"
                                 )
-                            mesh_note = "(mesh aligned to DepthPro depth via " + ", ".join(note_parts) + ")"
+                            mesh_note = "(mesh aligned to depth backend via " + ", ".join(note_parts) + ")"
                         visualization["pose_world"] = _pose_world_view_png(
                             depth,
                             intrinsics,
@@ -3056,12 +3271,9 @@ def create_ground_app(
 
         # ---- 相机系 / 世界系分组输出（顶层旧字段保留，向后兼容）----
 
-        intrinsics_list = [
-            [float(f_px), 0.0, float(width / 2)],
-            [0.0, float(f_px), float(height / 2)],
-            [0.0, 0.0, 1.0],
-        ]
-        depth_range_m = [float(np.nanmin(depth)), float(np.nanmax(depth))]
+        intrinsics_list = np.asarray(intrinsics, dtype=np.float64).tolist()
+        finite_depth = depth[np.isfinite(depth)]
+        depth_range_m = [float(finite_depth.min()), float(finite_depth.max())] if finite_depth.size else [0.0, 0.0]
         cam_ground = {
             "plane_normal": result["plane_normal"].astype(float).tolist(),
             "plane_d": float(result["plane_d"]),
@@ -3070,7 +3282,7 @@ def create_ground_app(
             "inlier_points": inliers_arr.astype(float).tolist(),
         }
         cam_info = {
-            "focal_px": f_px,
+            "focal_px": float(intrinsics[0, 0]),
             "intrinsics": intrinsics_list,
             "depth_range_m": depth_range_m,
             "image_hw": [height, width],
@@ -3148,6 +3360,29 @@ def create_ground_app(
                 "centroid_m": wf["contact_centroid_m"].tolist(),
             }
 
+        # 分段耗时（P0 性能测量；post_ms = 人物/接触/世界系/可视化编码）
+        total_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        timings: Dict[str, Any] = {
+            "segment_ms": segment_ms,
+            "depth_ms": depth_ms,
+            "ground_ms": ground_ms,
+            "depth_focal_px": round(f_px, 2),
+            "image_hw": [height, width],
+            "gpu_alloc_before_mb": alloc_before_mb,
+            "gpu_alloc_after_depth_mb": alloc_after_depth_mb,
+        }
+        if alloc_before_mb is not None and alloc_after_depth_mb is not None:
+            timings["depth_alloc_delta_mb"] = round(alloc_after_depth_mb - alloc_before_mb, 1)
+        if pose_wall_ms is not None:
+            timings["pose_wall_ms"] = pose_wall_ms
+            if isinstance(pose, dict) and pose.get("time_ms") is not None:
+                timings["pose_ms"] = pose.get("time_ms")
+        measured_ms = segment_ms + depth_ms + ground_ms + float(pose_wall_ms or 0.0)
+        timings["post_ms"] = round(max(0.0, total_ms - measured_ms), 1)
+        timings["total_ms"] = total_ms
+        _, timings["gpu_peak_mb"] = _gpu_memory_mb()
+        _log_stage_timings("ground", timings)
+
         return GroundResult(
             ok=True,
             plane_normal=result["plane_normal"].astype(float).tolist(),
@@ -3183,6 +3418,7 @@ def create_ground_app(
                 "person": world_person,
                 "contact": world_contact,
             },
+            timings=timings,
         )
 
     # ------------------------------------------------------------------
@@ -3228,7 +3464,7 @@ def create_ground_app(
                 # v2 XML 结构保持不变：队列信息只走 JSON 路径
                 payload = body
                 if fmt == "xml" and isinstance(body, dict):
-                    stripped = {"queue", "error_code", "retry_after_s"}
+                    stripped = {"queue", "error_code", "retry_after_s", "timings"}
                     if stripped & set(body):
                         payload = {k: v for k, v in body.items() if k not in stripped}
                 content, media = serializer.serialize_v2_response(payload, response_format=fmt)
@@ -3372,6 +3608,10 @@ if __name__ == "__main__":
     parser.add_argument("--sam-ckpt", type=str, default=str(DEFAULT_SAM_CKPT), help="SAM2 权重路径")
     parser.add_argument("--floor-prompt", type=str, default=DEFAULT_FLOOR_PROMPT, help="默认地面分割提示词")
     parser.add_argument("--person-prompt", type=str, default="person.", help="默认人物分割提示词；传空串禁用接触区域检测")
+    parser.add_argument("--depth-backend", choices=("depthpro", "moge2"), default="depthpro", help="深度模型后端；depthpro 可用于回滚")
+    parser.add_argument("--moge-model", type=str, default=MOGE_MODEL_DEFAULT, help="MoGe-2 Hugging Face 模型名")
+    parser.add_argument("--moge-num-tokens", type=int, default=None, help="MoGe-2 token 数；默认使用模型库默认值")
+    parser.add_argument("--depth-fp16", action="store_true", help="MoGe-2 CUDA 推理启用 FP16")
     parser.add_argument("--sam3d-resources", type=str, default=os.environ.get("SAM3D_RESOURCES"), help="ImagePose_Resources 根目录；配置后加载 SAM3D Body（不加载 ViTPose）")
     parser.add_argument(
         "--pose-queue-size",
@@ -3419,6 +3659,10 @@ if __name__ == "__main__":
         floor_prompt=args.floor_prompt,
         person_prompt=args.person_prompt,
         sam3d_resources=args.sam3d_resources,
+        depth_backend=args.depth_backend,
+        moge_model=args.moge_model,
+        moge_num_tokens=args.moge_num_tokens,
+        depth_fp16=args.depth_fp16,
         pose_queue_size=args.pose_queue_size,
         pose_queue_timeout=args.pose_queue_timeout,
         pose_queue_per_client=args.pose_queue_per_client,
